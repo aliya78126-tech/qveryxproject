@@ -149,15 +149,6 @@ function getNoteLimit() { return getCurrentPlan().limit; }
 function getMessageLimit() { return getCurrentPlan().messageLimit; }
 
 
-function simpleHash(str) {
-  let hash = 0;
-  for (let i = 0; i < str.length; i++) {
-    hash = (hash << 5) - hash + str.charCodeAt(i);
-    hash |= 0;
-  }
-  return 'h' + hash.toString(36) + str.length;
-}
-
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
@@ -174,18 +165,18 @@ function copyTextToClipboard(text, onDone) {
     tmp.style.opacity = '0';
     document.body.appendChild(tmp);
     tmp.select();
-    try { document.execCommand('copy'); } catch (err) {  }
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
     document.body.removeChild(tmp);
+    return ok;
   };
 
   if (navigator.clipboard && navigator.clipboard.writeText) {
     navigator.clipboard.writeText(text).then(() => onDone && onDone(true)).catch(() => {
-      fallbackCopy();
-      onDone && onDone(true);
+      onDone && onDone(fallbackCopy());
     });
   } else {
-    fallbackCopy();
-    onDone && onDone(true);
+    onDone && onDone(fallbackCopy());
   }
 }
 
@@ -483,33 +474,70 @@ function setupSpearSwingFeature() {
 
 
 
-function loadTheme() {
-  let saved = null;
-  try { saved = JSON.parse(localStorage.getItem(THEME_STORAGE_KEY) || 'null'); } catch (e) { saved = null; }
-  if (!saved) return;
-  const { values } = enforceThemeContrast({ ...getDefaultThemeValues(), ...saved });
-  THEME_VARS.forEach(v => {
-    if (values[v.key]) document.documentElement.style.setProperty(v.key, values[v.key]);
-  });
-  applySpearCursorSetting(saved.customCursorSpear);
+function resetThemeToDefaults() {
+  THEME_VARS.forEach(v => document.documentElement.style.removeProperty(v.key));
+  applySpearCursorSetting(false);
+  applyWallpaperSetting(null);
   setupSpearSwingFeature();
-  applyWallpaperSetting(saved.wallpaperId || null);
 }
 
+// Приводит сохранённое оформление к безопасному виду: только известные ключи,
+// корректные цвета, существующие обои. Битые данные из БД/localStorage не ломают UI.
+function sanitizeTheme(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const colorRe = /^(#[0-9a-f]{3,8}|(rgb|hsl)a?\([0-9.,%\s\/]+\))$/i;
+  const out = {};
+  THEME_VARS.forEach(v => {
+    const val = raw[v.key];
+    if (typeof val === 'string' && colorRe.test(val.trim())) out[v.key] = val.trim();
+  });
+  out.customCursorSpear = raw.customCursorSpear === true;
+  out.wallpaperId = (typeof raw.wallpaperId === 'string' && getWallpaperById(raw.wallpaperId)) ? raw.wallpaperId : null;
+  return out;
+}
 
-
-
-
-function loadThemeForAccount() {
-  const saved = currentProfile && currentProfile.theme;
-  if (!saved || typeof saved !== 'object') return;
+function applySavedTheme(rawTheme) {
+  resetThemeToDefaults();
+  const saved = sanitizeTheme(rawTheme);
+  if (!saved) return false;
   const { values } = enforceThemeContrast({ ...getDefaultThemeValues(), ...saved });
   THEME_VARS.forEach(v => {
     if (values[v.key]) document.documentElement.style.setProperty(v.key, values[v.key]);
   });
   applySpearCursorSetting(saved.customCursorSpear);
   setupSpearSwingFeature();
-  applyWallpaperSetting(saved.wallpaperId || null);
+  applyWallpaperSetting(saved.wallpaperId);
+  return true;
+}
+
+function readLocalTheme() {
+  try { return JSON.parse(localStorage.getItem(THEME_STORAGE_KEY) || 'null'); } catch (e) { return null; }
+}
+
+// Гостевое/локальное оформление (экран входа)
+function loadTheme() {
+  applySavedTheme(readLocalTheme());
+}
+
+// Оформление аккаунта. Если на аккаунте его ещё нет, а в браузере остался локальный
+// вариант от старой версии, переносим его на аккаунт один раз.
+function loadThemeForAccount() {
+  const accountTheme = currentProfile && currentProfile.theme;
+  if (sanitizeTheme(accountTheme)) {
+    applySavedTheme(accountTheme);
+    return;
+  }
+  const legacy = sanitizeTheme(readLocalTheme());
+  if (legacy && currentProfile && currentProfile.theme == null) {
+    applySavedTheme(legacy);
+    currentProfile.theme = legacy;
+    const userId = currentUser.id;
+    persistTheme(userId, legacy).then(ok => {
+      if (ok) { try { localStorage.removeItem(THEME_STORAGE_KEY); } catch (e) {} }
+    });
+    return;
+  }
+  applySavedTheme(null);
 }
 
 function getDefaultThemeValues() {
@@ -544,6 +572,9 @@ function applyThemeValues(values) {
 
 
 
+let pendingThemeSave = null;   // { userId, values } — ещё не отправлено на сервер
+let themeSaveChain = Promise.resolve();
+
 function saveCurrentTheme() {
   const values = getCurrentThemeValues();
 
@@ -554,18 +585,52 @@ function saveCurrentTheme() {
 
   if (currentProfile) currentProfile.theme = values;
 
+  // id аккаунта фиксируем сейчас: к моменту отправки пользователь может смениться
+  pendingThemeSave = { userId: currentUser.id, values };
   if (themeSaveTimer) clearTimeout(themeSaveTimer);
-  themeSaveTimer = setTimeout(async () => {
+  themeSaveTimer = setTimeout(() => {
     themeSaveTimer = null;
-    const { error } = await db.from('profiles').update({ theme: values }).eq('id', currentUser.id);
-    if (error) {
-      const el = document.getElementById('theme-warning');
-      if (el) {
-        el.innerHTML = `<div class="theme-warning-box"><div>Не удалось сохранить оформление на аккаунте: ${escapeHtml(error.message)}</div></div>`;
-      }
-    }
+    flushPendingThemeSave();
   }, THEME_SAVE_DEBOUNCE_MS);
 }
+
+// Запросы идут строго по очереди, поэтому более старое оформление
+// не может прийти на сервер позже нового.
+function persistTheme(userId, values) {
+  const run = async () => {
+    let error = null;
+    try {
+      ({ error } = await db.from('profiles').update({ theme: values }).eq('id', userId));
+    } catch (e) {
+      error = e;
+    }
+    const el = document.getElementById('theme-warning');
+    if (error) {
+      console.warn('theme save failed:', error);
+      if (el) {
+        el.innerHTML = `<div class="theme-warning-box"><div>Не удалось сохранить оформление на аккаунте: ${escapeHtml(error.message || String(error))}</div></div>`;
+      }
+      return false;
+    }
+    return true;
+  };
+  themeSaveChain = themeSaveChain.then(run, run);
+  return themeSaveChain;
+}
+
+// Отправить отложенное изменение немедленно (выход из аккаунта, закрытие вкладки)
+async function flushPendingThemeSave() {
+  if (themeSaveTimer) { clearTimeout(themeSaveTimer); themeSaveTimer = null; }
+  const pending = pendingThemeSave;
+  pendingThemeSave = null;
+  if (!pending) return true;
+  return persistTheme(pending.userId, pending.values);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') flushPendingThemeSave();
+});
+window.addEventListener('pagehide', () => { flushPendingThemeSave(); });
 
 async function resetTheme() {
   THEME_VARS.forEach(v => document.documentElement.style.removeProperty(v.key));
@@ -575,7 +640,9 @@ async function resetTheme() {
   if (currentUser) {
     if (currentProfile) currentProfile.theme = null;
     if (themeSaveTimer) { clearTimeout(themeSaveTimer); themeSaveTimer = null; }
-    await db.from('profiles').update({ theme: null }).eq('id', currentUser.id);
+    pendingThemeSave = null;
+    const ok = await persistTheme(currentUser.id, null);
+    if (!ok) await showAlert('Оформление сброшено на этом устройстве, но не сохранено на аккаунте.', 'ошибка');
   } else {
     try { localStorage.removeItem(THEME_STORAGE_KEY); } catch (e) {  }
   }
@@ -635,7 +702,7 @@ function renderThemePanel() {
     <div class="theme-actions">
       <button type="button" class="theme-reset-btn" onclick="resetTheme()">Сбросить кастомное оформление</button>
     </div>
-    <div class="theme-save-note">Оформление хранится локально в этом браузере и не влияет на других пользователей. Слишком похожие цвета автоматически корректируются, чтобы текст и кнопки оставались читаемыми.</div>
+    <div class="theme-save-note">Оформление (цвета, курсор и обои) сохраняется на вашем аккаунте, подтягивается на любом устройстве и не влияет на других пользователей. Слишком похожие цвета автоматически корректируются, чтобы текст и кнопки оставались читаемыми.</div>
   `;
 
   const presetsEl = document.getElementById('theme-presets');
@@ -1017,6 +1084,10 @@ let activeGroupName = null;
 let activeGroupId = null;
 let groupManageOpen = false;
 const unlockedGroupIds = new Set();
+// password_hash клиенту недоступен — читаем только публичные столбцы
+// lock_password клиенту недоступен — только флаг locked
+const NOTE_COLUMNS = 'id, user_id, title, content, tag, pinned, locked, updated_at';
+const GROUP_COLUMNS = 'id, name, name_lower, owner_id, has_password';
 let noteSelectMode = false;
 let selectedNoteIds = new Set();
 
@@ -1343,6 +1414,7 @@ async function handleLogout() {
   const ok = await confirmDiscardIfDirty();
   if (!ok) return;
 
+  await flushPendingThemeSave();
   await db.auth.signOut();
   currentUser = null;
   currentProfile = null;
@@ -1359,9 +1431,7 @@ async function handleLogout() {
   switchTab('login');
 
 
-  THEME_VARS.forEach(v => document.documentElement.style.removeProperty(v.key));
-  loadTheme();
-  setupSpearSwingFeature();
+  loadTheme();   // внутри — полный сброс оформления прошлого аккаунта
 }
 
 window.addEventListener('beforeunload', (e) => {
@@ -1442,10 +1512,13 @@ async function enterApp(user) {
   }
 
   if (currentProfile.banned) {
+    if (themeSaveTimer) { clearTimeout(themeSaveTimer); themeSaveTimer = null; }
+    pendingThemeSave = null;
     await db.auth.signOut();
     currentUser = null;
     currentProfile = null;
     unlockedGroupIds.clear();
+    loadTheme();
     showError('Этот аккаунт заблокирован администратором.');
     return;
   }
@@ -1474,13 +1547,19 @@ async function enterApp(user) {
 async function loadNotes() {
   const { data, error } = await db
     .from('notes')
-    .select('*')
+    .select(NOTE_COLUMNS)
     .eq('user_id', currentUser.id)
     .order('pinned', { ascending: false })
     .order('updated_at', { ascending: false });
 
-  notes = error ? [] : data;
+  if (error) {
+    // не подменяем список пустым — иначе кажется, что заметки пропали
+    await showAlert('Не удалось загрузить заметки: ' + error.message, 'ошибка');
+    return false;
+  }
+  notes = data;
   activeNoteId = notes.length > 0 ? notes[0].id : null;
+  return true;
 }
 
 
@@ -1610,8 +1689,14 @@ function renderSidebar() {
       pinBtn.title = note.pinned ? 'Открепить' : 'Закрепить';
       pinBtn.onclick = async (e) => {
         e.stopPropagation();
-        note.pinned = !note.pinned;
-        await db.from('notes').update({ pinned: note.pinned }).eq('id', note.id);
+        const prevPinned = note.pinned;
+        note.pinned = !prevPinned;
+        const { error: pinError } = await db.from('notes').update({ pinned: note.pinned }).eq('id', note.id).eq('user_id', currentUser.id);
+        if (pinError) {
+          note.pinned = prevPinned;
+          await showAlert('Не удалось изменить закрепление: ' + pinError.message, 'ошибка');
+          return;
+        }
         await loadNotes();
         activeNoteId = note.id;
         renderSidebar();
@@ -1678,8 +1763,14 @@ async function renameNotePrompt(id) {
   if (!note) return;
   const next = await showPrompt('Название заметки:', note.title || '', { eyebrow: 'переименовать' });
   if (next === null) return;
+  const prevTitle = note.title;
   note.title = next.trim();
-  await db.from('notes').update({ title: note.title, updated_at: new Date().toISOString() }).eq('id', id);
+  const { error: renameError } = await db.from('notes').update({ title: note.title, updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', currentUser.id);
+  if (renameError) {
+    note.title = prevTitle;
+    await showAlert('Не удалось переименовать заметку: ' + renameError.message, 'ошибка');
+    return;
+  }
   await loadNotes();
   activeNoteId = id;
   renderSidebar();
@@ -1761,9 +1852,9 @@ function renderEditor() {
   copyBtn.className = 'icon-btn neutral';
   copyBtn.textContent = 'скопировать';
   copyBtn.onclick = () => {
-    copyTextToClipboard(textarea.value, () => {
-      copyBtn.textContent = 'скопировано ✓';
-      setTimeout(() => { copyBtn.textContent = 'скопировать'; }, 1200);
+    copyTextToClipboard(textarea.value, (ok) => {
+      copyBtn.textContent = ok ? 'скопировано ✓' : 'не удалось скопировать';
+      setTimeout(() => { copyBtn.textContent = 'скопировать'; }, ok ? 1200 : 2000);
     });
   };
   actions.appendChild(copyBtn);
@@ -1882,11 +1973,17 @@ function renderEditor() {
 
 let unlockedNoteIdTemp = null;
 
-function tryUnlockNote(id) {
+async function tryUnlockNote(id) {
   const note = notes.find(n => n.id === id);
   const input = document.getElementById('unlock-input');
   if (!note || !input) return;
-  if (input.value === note.lock_password) {
+  // пароль заметки проверяется на сервере, клиент хеш не получает
+  const { data: ok, error } = await db.rpc('verify_note_lock', { p_note_id: String(id), p_password: input.value });
+  if (error) {
+    await showAlert('Не удалось проверить пароль: ' + error.message, 'ошибка');
+    return;
+  }
+  if (ok === true) {
     unlockedNoteId = id;
     renderEditor();
   } else {
@@ -1897,16 +1994,20 @@ function tryUnlockNote(id) {
 }
 
 async function toggleLock(note) {
-  if (note.locked) {
-    note.locked = false;
-    note.lock_password = null;
-  } else {
+  let newPassword = null;
+  if (!note.locked) {
     const pass = await showPrompt('Придумайте пароль для этой заметки:', '', { eyebrow: 'защита паролем', password: true, confirmLabel: 'Поставить' });
     if (!pass) return;
-    note.locked = true;
-    note.lock_password = pass;
+    newPassword = pass;
   }
-  await db.from('notes').update({ locked: note.locked, lock_password: note.lock_password }).eq('id', note.id);
+  // хеширование (bcrypt) и запись — на сервере; null снимает защиту
+  const { data: res, error } = await db.rpc('set_note_lock', { p_note_id: String(note.id), p_password: newPassword });
+  if (error || !res || res.status !== 'ok') {
+    const reason = error ? error.message : (res && res.status === 'weak' ? 'пароль слишком короткий (минимум 4 символа)' : 'нет прав на это действие');
+    await showAlert('Не удалось изменить защиту заметки: ' + reason, 'ошибка');
+    return;
+  }
+  note.locked = newPassword !== null;
   renderSidebar();
   renderEditor();
 }
@@ -1935,7 +2036,11 @@ async function showHistory(note) {
     .order('at', { ascending: false })
     .limit(10);
 
-  if (error || !history || history.length === 0) {
+  if (error) {
+    await showAlert('Не удалось загрузить историю версий: ' + error.message, 'ошибка');
+    return;
+  }
+  if (!history || history.length === 0) {
     await showAlert('История версий пока пуста — она начнёт заполняться по мере редактирования.', 'история версий');
     return;
   }
@@ -1943,8 +2048,14 @@ async function showHistory(note) {
   const idx = await showHistoryPicker(history);
   if (idx === null) return;
   if (idx >= 0 && idx < history.length) {
+    const prevContent = note.content;
     note.content = history[idx].content;
-    await db.from('notes').update({ content: note.content, updated_at: new Date().toISOString() }).eq('id', note.id);
+    const { error: restoreError } = await db.from('notes').update({ content: note.content, updated_at: new Date().toISOString() }).eq('id', note.id).eq('user_id', currentUser.id);
+    if (restoreError) {
+      note.content = prevContent;
+      await showAlert('Не удалось восстановить версию: ' + restoreError.message, 'ошибка');
+      return;
+    }
     await loadNotes();
     activeNoteId = note.id;
     renderEditor();
@@ -1980,7 +2091,7 @@ async function createNote() {
   const { data, error } = await db
     .from('notes')
     .insert({ user_id: currentUser.id, title: '', content: '', tag: '' })
-    .select()
+    .select(NOTE_COLUMNS)
     .single();
 
   if (error) { await showAlert('Не удалось создать заметку: ' + error.message, 'ошибка'); return; }
@@ -2132,13 +2243,14 @@ async function saveNote(note) {
   if (btn) btn.disabled = true;
 
   const nowIso = new Date().toISOString();
-  note.updated_at = nowIso;
+  const prevUpdatedAt = note.updated_at;
 
   const { error } = await db.from('notes').update({
     title: note.title, content: note.content, tag: note.tag, updated_at: nowIso
-  }).eq('id', note.id);
+  }).eq('id', note.id).eq('user_id', currentUser.id);
 
   if (error) {
+    note.updated_at = prevUpdatedAt;
     if (statusEl) {
       statusEl.textContent = 'ошибка сохранения';
       statusEl.classList.add('unsaved');
@@ -2148,8 +2260,15 @@ async function saveNote(note) {
     return false;
   }
 
+  note.updated_at = nowIso;
+
   if (getCurrentPlan().perks.history) {
-    await db.from('note_history').insert({ note_id: note.id, content: note.content });
+    const { error: histError } = await db.from('note_history').insert({ note_id: note.id, content: note.content });
+    if (histError) {
+      console.warn('note_history insert failed:', histError);
+      logEvent('error', 'Не удалось сохранить историю заметки', { note_id: note.id, error: histError.message });
+      await showAlert('Заметка сохранена, но запись в историю изменений не удалась: ' + histError.message, 'предупреждение');
+    }
   }
 
   noteHasUnsavedChanges = false;
@@ -2249,7 +2368,7 @@ function renderPricingGrid() {
 async function downgradeToFree() {
   const ok = await showConfirm('Перейти на бесплатный план? Платные функции станут недоступны.', { eyebrow: 'смена тарифа', confirmLabel: 'Перейти на Free', danger: true });
   if (!ok) return;
-  await setUserPlan('free');
+  if (!(await setUserPlan('free'))) return;
   renderPricingGrid();
   renderSidebar();
   renderEditor();
@@ -2603,12 +2722,16 @@ function showPaymentSuccess(p, subMessage) {
 
 
 async function setUserPlan(planKey) {
-  currentProfile.plan = planKey;
   const clearFields = { plan: planKey, custom_perks: null, custom_price: 0 };
-  LIMIT_OVERRIDE_FIELDS.forEach(f => { clearFields[f.column] = null; currentProfile[f.column] = null; });
-  currentProfile.custom_perks = null;
-  currentProfile.custom_price = 0;
-  await db.from('profiles').update(clearFields).eq('id', currentUser.id);
+  LIMIT_OVERRIDE_FIELDS.forEach(f => { clearFields[f.column] = null; });
+  // локальный профиль меняем только после успешной записи
+  const { error } = await db.from('profiles').update(clearFields).eq('id', currentUser.id);
+  if (error) {
+    await showAlert('Не удалось сменить план: ' + error.message, 'ошибка');
+    return false;
+  }
+  Object.assign(currentProfile, clearFields);
+  return true;
 }
 
 
@@ -3054,7 +3177,7 @@ async function renderGroupsPanel() {
     getOwnedGroupsCount(),
     db
       .from('recent_groups')
-      .select('group_id, last_visited, groups(id, name, name_lower, owner_id, password_hash)')
+      .select('group_id, last_visited, groups(id, name, name_lower, owner_id, has_password)')
       .eq('user_id', currentUser.id)
       .order('last_visited', { ascending: false })
       .limit(30),
@@ -3062,6 +3185,10 @@ async function renderGroupsPanel() {
 
   const limitReached = owned >= plan.groupLimit;
   const recentRows = recentResult.data;
+  if (recentResult.error) {
+    panel.innerHTML = `<div class="groups-block-title">Не удалось загрузить группы: ${escapeHtml(recentResult.error.message)}</div>`;
+    return;
+  }
 
   const recent = (recentRows || []).filter(r => r.groups);
   const myGroups = recent.filter(r => r.groups.owner_id === currentUser.id);
@@ -3069,7 +3196,7 @@ async function renderGroupsPanel() {
 
   function renderGroupItem(r, i) {
     const g = r.groups;
-    const isProtected = !!g.password_hash;
+    const isProtected = !!g.has_password;
     const isOwn = g.owner_id === currentUser.id;
     const delay = Math.min(i * 30, 240);
     const alreadyUnlocked = isProtected && unlockedGroupIds.has(g.id);
@@ -3166,8 +3293,16 @@ function openGroupPrompt(nameLower, displayName) {
 }
 
 async function enterOpenGroup(groupId) {
-  await db.from('recent_groups').upsert({ user_id: currentUser.id, group_id: groupId, last_visited: new Date().toISOString() });
-  const { data: g } = await db.from('groups').select('*').eq('id', groupId).maybeSingle();
+  const { error: recentErr } = await db.from('recent_groups').upsert({ user_id: currentUser.id, group_id: groupId, last_visited: new Date().toISOString() });
+  if (recentErr) {
+    await showAlert('Не удалось открыть группу: ' + recentErr.message, 'ошибка');
+    return;
+  }
+  const { data: g, error: gErr } = await db.from('groups').select(GROUP_COLUMNS).eq('id', groupId).maybeSingle();
+  if (gErr) {
+    await showAlert('Не удалось загрузить группу: ' + gErr.message, 'ошибка');
+    return;
+  }
   if (!g) return;
   if (activeGroupId !== g.id) groupManageOpen = false;
   unlockedGroupIds.add(g.id);
@@ -3204,18 +3339,23 @@ async function createGroup() {
   if (name.length < 2) { showGroupFormError('create-group-error', 'Название группы должно содержать не менее 2 символов.'); return; }
   if (wantsPassword && (!password || password.length < 4)) { showGroupFormError('create-group-error', 'Пароль группы должен содержать не менее 4 символов.'); return; }
 
-  const { data, error } = await db
-    .from('groups')
-    .insert({ name, password_hash: wantsPassword ? simpleHash(password) : null, owner_id: currentUser.id })
-    .select()
-    .single();
+  // пароль хешируется на сервере (bcrypt через pgcrypto)
+  const { data, error } = await db.rpc('create_group', {
+    p_name: name,
+    p_password: wantsPassword ? password : null,
+  });
 
   if (error) {
     showGroupFormError('create-group-error', error.code === '23505' ? 'Группа с таким названием уже существует.' : error.message);
     return;
   }
 
-  await db.from('recent_groups').upsert({ user_id: currentUser.id, group_id: data.id, last_visited: new Date().toISOString() });
+  const { error: recentErr } = await db.from('recent_groups').upsert({ user_id: currentUser.id, group_id: data.id, last_visited: new Date().toISOString() });
+  if (recentErr) {
+    showGroupFormError('create-group-error', 'Группа создана, но не добавлена в ваш список: ' + recentErr.message);
+    await renderGroupsPanel();
+    return;
+  }
   logEvent('user_action', 'Создана группа', { group_id: data.id, name });
 
   groupManageOpen = false;
@@ -3233,24 +3373,29 @@ async function joinGroup() {
 
   if (!name) { showGroupFormError('join-group-error', 'Введите название группы.'); return; }
 
-  const { data: g, error } = await db
-    .from('groups')
-    .select('*')
-    .eq('name_lower', name.toLowerCase())
-    .maybeSingle();
+  // проверка пароля выполняется на сервере
+  const { data: res, error } = await db.rpc('join_group', { p_name: name, p_password: password || null });
 
-  if (error || !g) {
+  if (error) {
+    showGroupFormError('join-group-error', 'Не удалось войти в группу: ' + error.message);
+    return;
+  }
+  if (!res || res.status === 'not_found') {
     showGroupFormError('join-group-error', 'Группа с таким названием не найдена.');
     return;
   }
-
-  const isProtected = !!g.password_hash;
-  if (isProtected && (!password || g.password_hash !== simpleHash(password))) {
+  if (res.status === 'wrong_password') {
     showGroupFormError('join-group-error', 'Неверный пароль группы.');
     return;
   }
 
-  await db.from('recent_groups').upsert({ user_id: currentUser.id, group_id: g.id, last_visited: new Date().toISOString() });
+  const g = { id: res.group_id, name_lower: res.name_lower };
+
+  const { error: recentErr } = await db.from('recent_groups').upsert({ user_id: currentUser.id, group_id: g.id, last_visited: new Date().toISOString() });
+  if (recentErr) {
+    showGroupFormError('join-group-error', 'Не удалось добавить группу в список: ' + recentErr.message);
+    return;
+  }
 
   unlockedGroupIds.add(g.id);
   groupManageOpen = false;
@@ -3269,21 +3414,13 @@ async function deleteGroup(groupId, groupName) {
   );
   if (!ok) return;
 
+  // Всё удаление (сообщения, recent_groups, сама группа) выполняется в одной
+  // транзакции на сервере: при любой ошибке откатывается целиком.
+  const { data: res, error } = await db.rpc('delete_group', { p_group_id: String(groupId) });
 
-
-  await Promise.all([
-    db.from('group_posts').delete().eq('group_id', groupId),
-    db.from('recent_groups').delete().eq('group_id', groupId),
-  ]);
-
-  const { error } = await db
-    .from('groups')
-    .delete()
-    .eq('id', groupId)
-    .eq('owner_id', currentUser.id);
-
-  if (error) {
-    await showAlert('Не удалось удалить группу: ' + error.message, 'ошибка');
+  if (error || !res || res.status !== 'ok') {
+    const reason = error ? error.message : 'у вас нет прав на это действие';
+    await showAlert('Не удалось удалить группу: ' + reason, 'ошибка');
     return;
   }
 
@@ -3295,7 +3432,11 @@ async function deleteGroup(groupId, groupName) {
 }
 
 async function forgetRecentGroup(groupId) {
-  await db.from('recent_groups').delete().eq('user_id', currentUser.id).eq('group_id', groupId);
+  const { error } = await db.from('recent_groups').delete().eq('user_id', currentUser.id).eq('group_id', groupId);
+  if (error) {
+    await showAlert('Не удалось убрать группу из списка: ' + error.message, 'ошибка');
+    return;
+  }
   if (activeGroupId === groupId) { activeGroupName = null; activeGroupId = null; }
   await renderGroupsPanel();
   await renderGroupArea();
@@ -3336,7 +3477,7 @@ async function buildGroupManagePanel(g, posts) {
   panel.appendChild(renameRow);
 
 
-  const isProtected = !!g.password_hash;
+  const isProtected = !!g.has_password;
   const passRow = document.createElement('div');
   passRow.className = 'group-manage-row';
   passRow.innerHTML = `
@@ -3443,10 +3584,13 @@ async function changeGroupPasswordPrompt(g) {
 }
 
 async function setGroupPassword(g, plainPassword) {
-  const password_hash = plainPassword ? simpleHash(plainPassword) : null;
-  const { error } = await db.from('groups').update({ password_hash }).eq('id', g.id).eq('owner_id', currentUser.id);
-  if (error) {
-    await showAlert('Не удалось обновить пароль: ' + error.message, 'ошибка');
+  const { data: res, error } = await db.rpc('set_group_password', {
+    p_group_id: String(g.id),
+    p_password: plainPassword || null,
+  });
+  if (error || !res || res.status !== 'ok') {
+    const reason = error ? error.message : (res && res.status === 'forbidden' ? 'нет прав на это действие' : 'недопустимый пароль');
+    await showAlert('Не удалось обновить пароль: ' + reason, 'ошибка');
     return;
   }
   await renderGroupsPanel();
@@ -3492,10 +3636,16 @@ async function renderGroupArea() {
 
 
   const [groupResult, postsResult, myCount] = await Promise.all([
-    db.from('groups').select('*').eq('id', activeGroupId).single(),
+    db.from('groups').select(GROUP_COLUMNS).eq('id', activeGroupId).single(),
     db.from('group_posts').select('*').eq('group_id', activeGroupId).order('created_at', { ascending: true }),
     getMyMessageCountInGroup(activeGroupId),
   ]);
+
+  if (groupResult.error || postsResult.error) {
+    const msg = (groupResult.error || postsResult.error).message;
+    area.innerHTML = `<div class="editor-empty"><div class="editor-empty-title">Не удалось загрузить группу</div><div>${escapeHtml(msg)}</div></div>`;
+    return;
+  }
 
   const g = groupResult.data;
   if (!g) {
@@ -3567,9 +3717,9 @@ async function renderGroupArea() {
       postEl.querySelector('.group-post-text').textContent = p.text;
       const copyPostBtn = postEl.querySelector('.group-post-copy-btn');
       copyPostBtn.onclick = () => {
-        copyTextToClipboard(p.text, () => {
-          copyPostBtn.textContent = 'скопировано ✓';
-          setTimeout(() => { copyPostBtn.textContent = 'скопировать'; }, 1200);
+        copyTextToClipboard(p.text, (ok) => {
+          copyPostBtn.textContent = ok ? 'скопировано ✓' : 'не удалось скопировать';
+          setTimeout(() => { copyPostBtn.textContent = 'скопировать'; }, ok ? 1200 : 2000);
         });
       };
       feed.appendChild(postEl);
