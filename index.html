@@ -172,21 +172,21 @@
 
 <!-- ================= PRICING MODAL ================= -->
 <div id="pricing-modal" class="modal-overlay hidden" onclick="if(event.target===this) closePricing()">
-  <div class="modal-card" id="pricing-card">
+  <div class="modal-card" id="pricing-card" role="dialog" aria-modal="true">
     <!-- content injected by JS: plan grid or checkout step -->
   </div>
 </div>
 
 <!-- ================= ADMIN PANEL MODAL ================= -->
 <div id="admin-modal" class="modal-overlay hidden" onclick="if(event.target===this) closeAdminPanel()">
-  <div class="modal-card admin-modal-card" id="admin-card">
+  <div class="modal-card admin-modal-card" id="admin-card" role="dialog" aria-modal="true">
     <!-- content injected by JS -->
   </div>
 </div>
 
 <!-- ================= THEME MODAL ================= -->
 <div id="theme-modal" class="modal-overlay hidden" onclick="if(event.target===this) closeThemePanel()">
-  <div class="modal-card" id="theme-card">
+  <div class="modal-card" id="theme-card" role="dialog" aria-modal="true">
     <!-- content injected by JS -->
   </div>
 </div>
@@ -203,7 +203,7 @@
 
 <!-- ================= CUSTOM DIALOG (replaces alert/confirm/prompt) ================= -->
 <div id="dialog-overlay" class="dialog-overlay hidden">
-  <div class="dialog-card" id="dialog-card">
+  <div class="dialog-card" id="dialog-card" role="dialog" aria-modal="true">
     <!-- content injected by JS -->
   </div>
 </div>
@@ -211,4 +211,4 @@
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script src="script.js"></script>
 </body>
-  </html>
+</html>

@@ -21,6 +21,9 @@ window.addEventListener('unhandledrejection', (e) => {
 
 
 
+// Версия текста согласия/политики, фиксируется в метаданных при регистрации
+const CONSENT_VERSION = '2026-draft';
+
 const YOOMONEY_WALLET = '4100119630704520';
 
 
@@ -151,11 +154,23 @@ function getMessageLimit() { return getCurrentPlan().messageLimit; }
 
 function escapeHtml(str) {
   const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+  div.textContent = str == null ? '' : String(str);
+  // innerHTML не экранирует кавычки — без этого значение нельзя безопасно класть в атрибуты
+  return div.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+// Идентификатор, который допустимо подставлять в inline-обработчик (uuid / число / слаг).
+// HTML-экранирование для JS-строк внутри атрибута НЕ подходит: браузер декодирует
+// сущности до выполнения JS, поэтому всё, что не похоже на id, отбрасываем.
+function safeId(v) {
+  const t = String(v == null ? '' : v);
+  return /^[A-Za-z0-9_-]{1,64}$/.test(t) ? t : '';
 }
 
 
+
+// Ошибка «функция не найдена» — миграция на сервере ещё не применена (совместимость при раскатке)
+function isMissingRpc(e) { return !!e && (e.code === 'PGRST202' || e.code === '42883'); }
 
 function copyTextToClipboard(text, onDone) {
   const fallbackCopy = () => {
@@ -298,11 +313,21 @@ const WALLPAPERS = [
 
 
 
+// Лимит на клиентские события за сессию страницы: циклическая JS-ошибка
+// иначе засоряет event_logs тысячами одинаковых строк.
+let logEventBudget = 60;
+const logEventSeen = new Map();
 async function logEvent(category, message, meta) {
   try {
+    const msg = String(message == null ? '' : message).slice(0, 500);
+    const key = category + '|' + msg;
+    const seen = (logEventSeen.get(key) || 0) + 1;
+    logEventSeen.set(key, seen);
+    if (seen > 3 || logEventBudget <= 0) return;
+    logEventBudget--;
     await db.from('event_logs').insert({
       category,
-      message,
+      message: msg,
       user_id: currentUser ? currentUser.id : null,
       meta: meta || null,
     });
@@ -1073,6 +1098,11 @@ function showHistoryPicker(historyRows) {
 
 let currentUser = null;
 let currentProfile = null;
+// «Эпоха» сессии: увеличивается при каждом входе/выходе/смене аккаунта. Любой асинхронный
+// запрос запоминает эпоху и, если к ответу она изменилась, ничего не пишет в интерфейс.
+let authEpoch = 0;
+let editorRenderedNoteId = null;   // какая заметка сейчас открыта в редакторе
+const savingNotes = new Map();     // id заметки -> Promise идущего сохранения
 let notes = [];
 let activeNoteId = null;
 let saveTimer = null;
@@ -1159,18 +1189,18 @@ async function handleRegister(e) {
   try {
     const { data, error } = await db.auth.signUp({
       email, password,
-      options: { data: { display_name: displayName } }
+      options: { data: { display_name: displayName, consent_at: new Date().toISOString(), consent_version: CONSENT_VERSION } }
     });
 
     hideEmailPendingModal();
 
     if (error) {
       showError(translateAuthError(error.message));
-      logEvent('auth', 'Ошибка регистрации: ' + error.message, { email, displayName });
+      logEvent('auth', 'Ошибка регистрации: ' + error.message, {});
       return;
     }
 
-    logEvent('auth', 'Регистрация', { email, displayName });
+    logEvent('auth', 'Регистрация', {});
     if (data.session) {
       await enterApp(data.session.user);
     } else {
@@ -1214,13 +1244,13 @@ async function handleLogin(e) {
 
     if (error) {
       showError(translateAuthError(error.message));
-      logEvent('auth', 'Ошибка входа: ' + error.message, { email });
+      logEvent('auth', 'Ошибка входа: ' + error.message, {});
       return;
     }
 
-    await enterApp(data.user);
-    logEvent('auth', 'Вход выполнен', { email });
+    const entered = await enterApp(data.user);
     document.getElementById('login-form').reset();
+    if (entered) logEvent('auth', 'Вход выполнен', {});
   } catch (err) {
     console.error('Login failed:', err);
     showError('Не удалось войти: ' + (err && err.message ? err.message : 'неизвестная ошибка') + '. Попробуйте ещё раз.');
@@ -1235,6 +1265,9 @@ function translateAuthError(msg) {
   if (/password.*at least/i.test(msg)) return 'Пароль слишком короткий.';
   if (/same password/i.test(msg)) return 'Новый пароль должен отличаться от текущего.';
   if (/rate limit|too many/i.test(msg)) return 'Слишком много попыток. Подождите немного и попробуйте снова.';
+  if (/email not confirmed/i.test(msg)) return 'Email не подтверждён. Перейдите по ссылке из письма.';
+  if (/session.*missing|token.*(expired|invalid)|otp.*expired|link.*expired/i.test(msg)) return 'Ссылка недействительна или устарела. Запросите новую.';
+  if (/failed to fetch|network/i.test(msg)) return 'Нет соединения с сервером. Проверьте интернет и повторите.';
   return msg;
 }
 
@@ -1272,9 +1305,29 @@ async function handleForgotPassword(e) {
 function setupPasswordRecoveryListener() {
   db.auth.onAuthStateChange((event, session) => {
     if (event === 'PASSWORD_RECOVERY') {
+      // сессия восстановления не должна наследовать данные ранее открытого аккаунта
+      clearSessionState();
       document.getElementById('auth-screen').classList.remove('hidden');
       document.getElementById('app').classList.add('hidden');
       switchTab('reset');
+      return;
+    }
+    if (!currentUser) return;
+    if (event === 'SIGNED_OUT') {
+      // выход в другой вкладке или истечение/отзыв сессии
+      clearSessionState();
+      document.getElementById('app').classList.add('hidden');
+      document.getElementById('auth-screen').classList.remove('hidden');
+      switchTab('login');
+      loadTheme();
+      showError('Сессия завершена. Войдите снова.');
+      return;
+    }
+    // в другой вкладке вошли под другим аккаунтом (сессия общая на весь браузер):
+    // самый надёжный способ не смешать данные — перезагрузить страницу
+    if (session && session.user && session.user.id !== currentUser.id &&
+        (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED')) {
+      setTimeout(() => window.location.reload(), 0);
     }
   });
 }
@@ -1410,21 +1463,49 @@ function openChangePasswordDialog() {
   });
 }
 
-async function handleLogout() {
-  const ok = await confirmDiscardIfDirty();
-  if (!ok) return;
-
-  await flushPendingThemeSave();
-  await db.auth.signOut();
+// Полный сброс данных аккаунта в памяти. Увеличивает authEpoch, поэтому все запросы,
+// начатые до этого момента, не смогут изменить интерфейс.
+function clearSessionState() {
+  authEpoch++;
   currentUser = null;
   currentProfile = null;
   notes = [];
   activeNoteId = null;
   unlockedNoteId = null;
+  noteHasUnsavedChanges = false;
+  noteSavedSnapshot = null;
+  editorRenderedNoteId = null;
+  noteSelectMode = false;
+  selectedNoteIds.clear();
+  savingNotes.clear();
   activeGroupName = null;
   activeGroupId = null;
+  groupManageOpen = false;
   unlockedGroupIds.clear();
   currentSection = 'notes';
+  adminLookupResult = null;
+  if (themeSaveTimer) { clearTimeout(themeSaveTimer); themeSaveTimer = null; }
+  pendingThemeSave = null;
+  const editorArea = document.getElementById('editor-area');
+  if (editorArea) editorArea.innerHTML = '';
+  const noteList = document.getElementById('note-list');
+  if (noteList) noteList.innerHTML = '';
+  const groupsPanel = document.getElementById('groups-panel');
+  if (groupsPanel) groupsPanel.innerHTML = '';
+  ['pricing-modal', 'admin-modal', 'theme-modal'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.classList.add('hidden');
+  });
+  document.body.style.overflow = '';
+}
+
+async function handleLogout() {
+  const ok = await confirmDiscardIfDirty();
+  if (!ok) return;
+
+  await flushPendingThemeSave();
+  try { await db.auth.signOut(); } catch (e) { console.warn('signOut failed:', e); }
+  clearSessionState();
   showMobileList();
   document.getElementById('app').classList.add('hidden');
   document.getElementById('auth-screen').classList.remove('hidden');
@@ -1489,38 +1570,50 @@ function copyUserId() {
 
 
 
+// Возвращает true, если пользователь вошёл, false — если вход не состоялся или устарел.
 async function enterApp(user) {
+  // Если параллельно запущен другой вход/выход, эпоха изменится, и этот вызов молча завершится.
+  const epoch = ++authEpoch;
   currentUser = user;
+  const stale = () => epoch !== authEpoch || !currentUser || currentUser.id !== user.id;
 
-  const { data: profile, error } = await db
-    .from('profiles')
-    .select('*')
-    .eq('id', user.id)
-    .single();
+  const fetchProfile = () => db.from('profiles').select('*').eq('id', user.id).single();
+  let { data: profile, error } = await fetchProfile();
+  if (stale()) return false;
 
   if (error || !profile) {
-
+    // Профиль создаётся триггером после регистрации и может появиться с задержкой.
     let retryProfile = null;
+    let lastError = error;
     for (let i = 0; i < 5 && !retryProfile; i++) {
       await new Promise(r => setTimeout(r, 500));
-      const retry = await db.from('profiles').select('*').eq('id', user.id).single();
-      if (retry.data) retryProfile = retry.data;
+      const retry = await fetchProfile();
+      if (stale()) return false;
+      if (retry.data) retryProfile = retry.data; else lastError = retry.error;
     }
-    currentProfile = retryProfile || { id: user.id, display_name: user.email, plan: 'free' };
-  } else {
-    currentProfile = profile;
+    if (retryProfile) {
+      profile = retryProfile;
+    } else if (lastError && lastError.code !== 'PGRST116') {
+      // Сетевая/серверная ошибка: не пускаем с «заглушкой» — иначе заблокированный
+      // аккаунт (banned) прошёл бы проверку только потому, что профиль не загрузился.
+      currentUser = null;
+      try { await db.auth.signOut(); } catch (e) {}
+      showError('Не удалось загрузить профиль: ' + translateAuthError(lastError.message || 'ошибка сети') + ' Попробуйте ещё раз.');
+      return false;
+    } else {
+      profile = { id: user.id, display_name: user.email, plan: 'free' };
+    }
   }
+  currentProfile = profile;
 
   if (currentProfile.banned) {
     if (themeSaveTimer) { clearTimeout(themeSaveTimer); themeSaveTimer = null; }
     pendingThemeSave = null;
-    await db.auth.signOut();
-    currentUser = null;
-    currentProfile = null;
-    unlockedGroupIds.clear();
+    try { await db.auth.signOut(); } catch (e) {}
+    clearSessionState();
     loadTheme();
     showError('Этот аккаунт заблокирован администратором.');
-    return;
+    return false;
   }
 
   document.getElementById('auth-screen').classList.add('hidden');
@@ -1530,8 +1623,18 @@ async function enterApp(user) {
   document.getElementById('admin-row').classList.toggle('hidden', !currentProfile.is_admin);
   loadThemeForAccount();
 
+  // чистое состояние интерфейса для нового аккаунта
+  notes = [];
+  activeNoteId = null;
+  unlockedNoteId = null;
+  noteHasUnsavedChanges = false;
+  noteSavedSnapshot = null;
+  editorRenderedNoteId = null;
+  selectedNoteIds.clear();
+  noteSelectMode = false;
   activeGroupName = null;
   activeGroupId = null;
+  groupManageOpen = false;
   currentSection = 'notes';
   showMobileList();
   document.getElementById('tab-section-notes').classList.add('active');
@@ -1540,25 +1643,50 @@ async function enterApp(user) {
   document.getElementById('groups-panel').classList.add('hidden');
 
   await loadNotes();
+  if (stale()) return false;
   renderSidebar();
   renderEditor();
+  return true;
 }
 
 async function loadNotes() {
+  if (!currentUser) return false;
+  const epoch = authEpoch;
+  const uid = currentUser.id;
   const { data, error } = await db
     .from('notes')
     .select(NOTE_COLUMNS)
-    .eq('user_id', currentUser.id)
+    .eq('user_id', uid)
     .order('pinned', { ascending: false })
     .order('updated_at', { ascending: false });
+
+  // за время запроса аккаунт сменился — этот ответ уже чужой
+  if (epoch !== authEpoch || !currentUser || currentUser.id !== uid) return false;
 
   if (error) {
     // не подменяем список пустым — иначе кажется, что заметки пропали
     await showAlert('Не удалось загрузить заметки: ' + error.message, 'ошибка');
     return false;
   }
-  notes = data;
-  activeNoteId = notes.length > 0 ? notes[0].id : null;
+
+  // Объекты заметок сохраняем (редактор привязан к ним), а несохранённые правки
+  // открытой заметки не затираем серверной версией.
+  const dirtyId = currentNoteIsDirty() ? activeNoteId : null;
+  const prevById = new Map(notes.map(n => [n.id, n]));
+  notes = data.map(row => {
+    const prev = prevById.get(row.id);
+    if (!prev) return row;
+    if (row.id === dirtyId) {
+      const { title, content, tag } = prev;
+      Object.assign(prev, row, { title, content, tag });
+    } else {
+      Object.assign(prev, row);
+    }
+    return prev;
+  });
+  if (!notes.some(n => n.id === activeNoteId)) {
+    activeNoteId = notes.length > 0 ? notes[0].id : null;
+  }
   return true;
 }
 
@@ -1698,7 +1826,6 @@ function renderSidebar() {
           return;
         }
         await loadNotes();
-        activeNoteId = note.id;
         renderSidebar();
       };
       item.appendChild(pinBtn);
@@ -1762,7 +1889,7 @@ async function renameNotePrompt(id) {
   const note = notes.find(n => n.id === id);
   if (!note) return;
   const next = await showPrompt('Название заметки:', note.title || '', { eyebrow: 'переименовать' });
-  if (next === null) return;
+  if (next === null || !currentUser || !notes.includes(note)) return;
   const prevTitle = note.title;
   note.title = next.trim();
   const { error: renameError } = await db.from('notes').update({ title: note.title, updated_at: new Date().toISOString() }).eq('id', id).eq('user_id', currentUser.id);
@@ -1771,10 +1898,10 @@ async function renameNotePrompt(id) {
     await showAlert('Не удалось переименовать заметку: ' + renameError.message, 'ошибка');
     return;
   }
+  if (id === activeNoteId && noteSavedSnapshot) noteSavedSnapshot.title = note.title || '';
   await loadNotes();
-  activeNoteId = id;
   renderSidebar();
-  if (activeNoteId === id) renderEditor();
+  if (id === activeNoteId) renderEditor();
 }
 
 
@@ -1788,16 +1915,22 @@ function renderEditor() {
 
   if (!note) {
     area.innerHTML = `<div class="editor-empty"></div>`;
+    editorRenderedNoteId = null;
+    noteHasUnsavedChanges = false;
+    noteSavedSnapshot = null;
     return;
   }
 
   if (plan.perks.lockNote && note.locked && note.id !== unlockedNoteId) {
+    editorRenderedNoteId = null;
+    noteHasUnsavedChanges = false;
+    noteSavedSnapshot = null;
     area.innerHTML = `
       <div class="editor-empty">
         <div class="editor-empty-title">🔒 Заметка защищена паролем</div>
         <div>Введите пароль, чтобы открыть «${escapeHtml(note.title || 'без названия')}».</div>
         <input type="password" id="unlock-input" class="unlock-input">
-        <button type="button" onclick="tryUnlockNote('${note.id}')">Открыть</button>
+        <button type="button" onclick="tryUnlockNote('${safeId(note.id)}')">Открыть</button>
       </div>`;
     const unlockInput = document.getElementById('unlock-input');
     unlockInput.focus();
@@ -1933,17 +2066,23 @@ function renderEditor() {
     if (btn) btn.classList.add('has-changes');
   }
 
-  // baseline snapshot for "unsaved changes" comparison
-  noteSavedSnapshot = { title: note.title || '', content: note.content || '', tag: note.tag || '' };
-  noteHasUnsavedChanges = false;
+  // baseline snapshot for "unsaved changes" comparison.
+  // Повторная отрисовка той же заметки (после переименования другой, закрепления и т.п.)
+  // не должна сбрасывать признак несохранённых правок.
+  const keepDirty = !!(noteHasUnsavedChanges && noteSavedSnapshot && editorRenderedNoteId === note.id);
+  if (!keepDirty) {
+    noteSavedSnapshot = { title: note.title || '', content: note.content || '', tag: note.tag || '' };
+    noteHasUnsavedChanges = false;
+  }
+  editorRenderedNoteId = note.id;
 
+  // Вставка в середину текста раньше обходила лимит (обрезалось только при курсоре в конце)
+  textarea.maxLength = charLimit;
   textarea.oninput = () => {
     if (textarea.value.length > charLimit) {
-
-      const trimmedValue = textarea.value.slice(0, charLimit);
-      const cursorAtEnd = textarea.selectionStart === textarea.value.length;
-      textarea.value = trimmedValue + (cursorAtEnd ? '' : textarea.value.slice(trimmedValue.length));
-      if (cursorAtEnd) textarea.selectionStart = textarea.selectionEnd = textarea.value.length;
+      const caret = Math.min(textarea.selectionStart, charLimit);
+      textarea.value = textarea.value.slice(0, charLimit);
+      textarea.selectionStart = textarea.selectionEnd = caret;
     }
     note.content = textarea.value;
     updateCharCounter();
@@ -1954,6 +2093,7 @@ function renderEditor() {
       e.preventDefault();
       const start = textarea.selectionStart;
       const end = textarea.selectionEnd;
+      if (textarea.value.length - (end - start) + 1 > charLimit) return;
       textarea.value = textarea.value.substring(0, start) + '\t' + textarea.value.substring(end);
       textarea.selectionStart = textarea.selectionEnd = start + 1;
       note.content = textarea.value;
@@ -1968,10 +2108,9 @@ function renderEditor() {
 
   area.appendChild(topbar);
   area.appendChild(textarea);
+  if (keepDirty) markUnsaved();
   if (window.innerWidth > 760) textarea.focus();
 }
-
-let unlockedNoteIdTemp = null;
 
 async function tryUnlockNote(id) {
   const note = notes.find(n => n.id === id);
@@ -2013,7 +2152,9 @@ async function toggleLock(note) {
 }
 
 async function exportNote(note) {
-  const filename = (note.title && note.title.trim() ? note.title.trim() : 'без названия') + '.txt';
+  const safeTitle = (note.title && note.title.trim() ? note.title.trim() : 'без названия')
+    .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').slice(0, 100);
+  const filename = safeTitle + '.txt';
   const ok = await showConfirm(`Файл «${filename}» будет сохранён на устройство.`, { eyebrow: 'экспорт заметки', confirmLabel: 'Скачать' });
   if (!ok) return;
 
@@ -2048,16 +2189,27 @@ async function showHistory(note) {
   const idx = await showHistoryPicker(history);
   if (idx === null) return;
   if (idx >= 0 && idx < history.length) {
-    const prevContent = note.content;
-    note.content = history[idx].content;
-    const { error: restoreError } = await db.from('notes').update({ content: note.content, updated_at: new Date().toISOString() }).eq('id', note.id).eq('user_id', currentUser.id);
-    if (restoreError) {
-      note.content = prevContent;
-      await showAlert('Не удалось восстановить версию: ' + restoreError.message, 'ошибка');
+    // восстановление заменяет содержимое — сначала решаем судьбу несохранённых правок
+    if (!(await confirmDiscardIfDirty())) return;
+    const epoch = authEpoch;
+    const restored = history[idx].content;
+    const { data: upd, error: restoreError } = await db.from('notes')
+      .update({ content: restored, updated_at: new Date().toISOString() })
+      .eq('id', note.id).eq('user_id', currentUser.id)
+      .select('updated_at');
+    if (epoch !== authEpoch) return;
+    if (restoreError || !upd || upd.length === 0) {
+      await showAlert('Не удалось восстановить версию: ' + (restoreError ? restoreError.message : 'заметка не найдена'), 'ошибка');
       return;
     }
+    note.content = restored;
+    note.updated_at = upd[0].updated_at;
+    noteHasUnsavedChanges = false;
+    noteSavedSnapshot = { title: note.title || '', content: restored, tag: note.tag || '' };
     await loadNotes();
+    if (epoch !== authEpoch) return;
     activeNoteId = note.id;
+    renderSidebar();
     renderEditor();
   }
 }
@@ -2083,25 +2235,36 @@ function formatUpdated(ts) {
 
 
 
+let creatingNote = false;
 async function createNote() {
+  if (creatingNote) return;              // защита от двойного клика
   if (notes.length >= getNoteLimit()) return;
-  const ok = await confirmDiscardIfDirty();
-  if (!ok) return;
+  creatingNote = true;
+  try {
+    const ok = await confirmDiscardIfDirty();
+    if (!ok) return;
+    const epoch = authEpoch;
 
-  const { data, error } = await db
-    .from('notes')
-    .insert({ user_id: currentUser.id, title: '', content: '', tag: '' })
-    .select(NOTE_COLUMNS)
-    .single();
+    const { data, error } = await db
+      .from('notes')
+      .insert({ user_id: currentUser.id, title: '', content: '', tag: '' })
+      .select(NOTE_COLUMNS)
+      .single();
 
-  if (error) { await showAlert('Не удалось создать заметку: ' + error.message, 'ошибка'); return; }
+    if (epoch !== authEpoch) return;
+    if (error) { await showAlert('Не удалось создать заметку: ' + error.message, 'ошибка'); return; }
 
-  logEvent('user_action', 'Создана заметка', { note_id: data.id });
-  await loadNotes();
-  activeNoteId = data.id;
-  renderSidebar();
-  renderEditor();
-  collapseMobileSidebar();
+    logEvent('user_action', 'Создана заметка', { note_id: data.id });
+    await loadNotes();
+    if (epoch !== authEpoch) return;
+    activeNoteId = data.id;
+    unlockedNoteId = null;
+    renderSidebar();
+    renderEditor();
+    collapseMobileSidebar();
+  } finally {
+    creatingNote = false;
+  }
 }
 
 async function selectNote(id) {
@@ -2115,15 +2278,24 @@ async function selectNote(id) {
   collapseMobileSidebar();
 }
 
+// Удаление заметок вместе с историей одной транзакцией на сервере (RPC delete_my_notes).
+// Если миграция ещё не применена — прямое удаление, как раньше.
+async function deleteNotesByIds(ids) {
+  const { error } = await db.rpc('delete_my_notes', { p_ids: ids.map(String) });
+  if (!error) return { error: null };
+  if (error.code === 'PGRST202' || error.code === '42883') {
+    return await db.from('notes').delete().in('id', ids).eq('user_id', currentUser.id);
+  }
+  return { error };
+}
+
 async function deleteNote(id) {
   const ok = await showConfirm('Удалить эту заметку без возможности восстановления?', { eyebrow: 'удаление заметки', confirmLabel: 'Удалить', danger: true });
   if (!ok) return;
 
-  const { error } = await db
-    .from('notes')
-    .delete()
-    .eq('id', id)
-    .eq('user_id', currentUser.id);
+  const epoch = authEpoch;
+  const { error } = await deleteNotesByIds([id]);
+  if (epoch !== authEpoch) return;
 
   if (error) {
     await showAlert('Не удалось удалить заметку: ' + error.message, 'ошибка');
@@ -2204,19 +2376,21 @@ async function deleteSelectedNotes() {
   );
   if (!ok) return;
 
-  const { error } = await db
-    .from('notes')
-    .delete()
-    .in('id', ids)
-    .eq('user_id', currentUser.id);
+  const epoch = authEpoch;
+  const { error } = await deleteNotesByIds(ids);
+  if (epoch !== authEpoch) return;
 
   if (error) {
     await showAlert('Не удалось удалить заметки: ' + error.message, 'ошибка');
     return;
   }
 
-  notes = notes.filter(n => !selectedNoteIds.has(n.id));
   if (selectedNoteIds.has(activeNoteId)) {
+    noteHasUnsavedChanges = false;
+    noteSavedSnapshot = null;
+  }
+  notes = notes.filter(n => !selectedNoteIds.has(n.id));
+  if (!notes.some(n => n.id === activeNoteId)) {
     activeNoteId = notes.length > 0 ? notes[0].id : null;
   }
   selectedNoteIds.clear();
@@ -2230,9 +2404,22 @@ async function deleteSelectedNotes() {
   showMobileList();
 }
 
-async function saveNote(note) {
+// Параллельные сохранения одной заметки склеиваются в одно (нажали «сохранить» и Ctrl+S подряд).
+function saveNote(note) {
   if (!note) note = notes.find(n => n.id === activeNoteId);
-  if (!note) return;
+  if (!note) return Promise.resolve(undefined);
+  const running = savingNotes.get(note.id);
+  if (running) return running;
+  const promise = doSaveNote(note).finally(() => { savingNotes.delete(note.id); });
+  savingNotes.set(note.id, promise);
+  return promise;
+}
+
+async function doSaveNote(note) {
+  if (!currentUser) return false;
+  const epoch = authEpoch;
+  const uid = currentUser.id;
+  const isActive = () => epoch === authEpoch && note.id === activeNoteId;
 
   const statusEl = document.getElementById('save-status');
   const btn = document.getElementById('save-note-btn');
@@ -2242,46 +2429,84 @@ async function saveNote(note) {
   }
   if (btn) btn.disabled = true;
 
+  // Что именно отправляем: правки, сделанные во время запроса, останутся «несохранёнными»
+  const sent = { title: note.title || '', content: note.content || '', tag: note.tag || '' };
+  const contentChanged = !(note.id === activeNoteId && noteSavedSnapshot) || noteSavedSnapshot.content !== sent.content;
+  const expectedUpdatedAt = note.updated_at;
   const nowIso = new Date().toISOString();
-  const prevUpdatedAt = note.updated_at;
 
-  const { error } = await db.from('notes').update({
-    title: note.title, content: note.content, tag: note.tag, updated_at: nowIso
-  }).eq('id', note.id).eq('user_id', currentUser.id);
-
-  if (error) {
-    note.updated_at = prevUpdatedAt;
-    if (statusEl) {
-      statusEl.textContent = 'ошибка сохранения';
-      statusEl.classList.add('unsaved');
-    }
-    if (btn) btn.disabled = false;
-    await showAlert('Не удалось сохранить заметку: ' + error.message, 'ошибка');
+  const fail = async (msg) => {
+    if (epoch !== authEpoch) return false;
+    const st = document.getElementById('save-status');
+    if (st && isActive()) { st.textContent = 'ошибка сохранения'; st.classList.add('unsaved'); }
+    const b = document.getElementById('save-note-btn');
+    if (b) b.disabled = false;
+    await showAlert(msg, 'ошибка');
     return false;
+  };
+
+  // Оптимистичная блокировка: обновляем только если запись не менялась с момента загрузки
+  const doUpdate = (guard) => {
+    let q = db.from('notes')
+      .update({ title: sent.title, content: sent.content, tag: sent.tag, updated_at: nowIso })
+      .eq('id', note.id).eq('user_id', uid);
+    if (guard && expectedUpdatedAt) q = q.eq('updated_at', expectedUpdatedAt);
+    return q.select('updated_at');
+  };
+
+  let res = await doUpdate(true);
+  if (epoch !== authEpoch) return false;
+
+  if (!res.error && (!res.data || res.data.length === 0)) {
+    const cur = await db.from('notes').select('id').eq('id', note.id).eq('user_id', uid).maybeSingle();
+    if (epoch !== authEpoch) return false;
+    if (cur.error) return fail('Не удалось сохранить заметку: ' + cur.error.message);
+    if (!cur.data) return fail('Не удалось сохранить: заметка была удалена в другом окне или на другом устройстве.');
+    const overwrite = await showConfirm(
+      'Эта заметка была изменена в другом окне или на другом устройстве. Перезаписать ту версию текстом, который открыт здесь?',
+      { eyebrow: 'конфликт версий', confirmLabel: 'Перезаписать', danger: true }
+    );
+    if (epoch !== authEpoch) return false;
+    if (!overwrite) return fail('Сохранение отменено: на сервере более новая версия заметки.');
+    res = await doUpdate(false);
+    if (epoch !== authEpoch) return false;
   }
 
-  note.updated_at = nowIso;
+  if (res.error) return fail('Не удалось сохранить заметку: ' + res.error.message);
+  if (!res.data || res.data.length === 0) return fail('Не удалось сохранить заметку: запись не найдена или нет прав.');
 
-  if (getCurrentPlan().perks.history) {
-    const { error: histError } = await db.from('note_history').insert({ note_id: note.id, content: note.content });
+  note.updated_at = res.data[0].updated_at || nowIso;
+
+  if (contentChanged && getCurrentPlan().perks.history) {
+    const { error: histError } = await db.from('note_history').insert({ note_id: note.id, content: sent.content });
+    if (epoch !== authEpoch) return true;
     if (histError) {
       console.warn('note_history insert failed:', histError);
       logEvent('error', 'Не удалось сохранить историю заметки', { note_id: note.id, error: histError.message });
       await showAlert('Заметка сохранена, но запись в историю изменений не удалась: ' + histError.message, 'предупреждение');
     }
   }
+  if (epoch !== authEpoch) return true;
 
-  noteHasUnsavedChanges = false;
-  noteSavedSnapshot = { title: note.title || '', content: note.content || '', tag: note.tag || '' };
+  if (note.id === activeNoteId) {
+    noteSavedSnapshot = sent;
+    noteHasUnsavedChanges = (note.title || '') !== sent.title || (note.content || '') !== sent.content || (note.tag || '') !== sent.tag;
+  }
 
   const el = document.getElementById('save-status');
-  if (el) {
-    el.textContent = formatUpdated(nowIso);
-    el.classList.add('saved');
-    el.classList.remove('unsaved');
+  if (el && isActive()) {
+    if (noteHasUnsavedChanges) {
+      el.textContent = 'не сохранено';
+      el.classList.add('unsaved');
+      el.classList.remove('saved');
+    } else {
+      el.textContent = formatUpdated(note.updated_at);
+      el.classList.add('saved');
+      el.classList.remove('unsaved');
+    }
   }
   const btn2 = document.getElementById('save-note-btn');
-  if (btn2) { btn2.disabled = false; btn2.classList.remove('has-changes'); }
+  if (btn2) { btn2.disabled = false; btn2.classList.toggle('has-changes', !!(isActive() && noteHasUnsavedChanges)); }
 
   renderSidebar();
   return true;
@@ -2302,9 +2527,17 @@ async function confirmDiscardIfDirty() {
   const choice = await showUnsavedChangesPrompt();
   if (choice === 'save') {
     const note = notes.find(n => n.id === activeNoteId);
-    return await saveNote(note);
+    return (await saveNote(note)) === true;
   }
   if (choice === 'discard') {
+    // «Не сохранять» должно реально откатить правки в памяти: иначе при возврате к заметке
+    // несохранённый текст выглядел бы сохранённым.
+    const note = notes.find(n => n.id === activeNoteId);
+    if (note && noteSavedSnapshot) {
+      note.title = noteSavedSnapshot.title;
+      note.content = noteSavedSnapshot.content;
+      note.tag = noteSavedSnapshot.tag;
+    }
     noteHasUnsavedChanges = false;
     return true;
   }
@@ -2518,30 +2751,41 @@ function proceedToCustomCheckout() {
   if (backBtn) backBtn.onclick = renderCustomBuilder;
 }
 
+// Сброс докупленного до базовых значений плана. Раньше клиент сам писал лимиты в profiles —
+// то же самое действие позволяло выдать себе любые лимиты бесплатно. Теперь это делает сервер.
+async function clearMyAddons() {
+  const { error } = await db.rpc('clear_my_addons');
+  if (!error) return { error: null };
+  if (isMissingRpc(error)) {
+    const cleared = { custom_perks: null, custom_price: 0 };
+    LIMIT_OVERRIDE_FIELDS.forEach(f => { cleared[f.column] = null; });
+    return await db.from('profiles').update(cleared).eq('id', currentUser.id);
+  }
+  return { error };
+}
+
+async function refreshCurrentProfile() {
+  const epoch = authEpoch;
+  const uid = currentUser && currentUser.id;
+  if (!uid) return false;
+  const { data, error } = await db.from('profiles').select('*').eq('id', uid).single();
+  if (epoch !== authEpoch || error || !data) return false;
+  currentProfile = data;
+  return true;
+}
+
 async function confirmCustomPayment(limits, perks, addOnPrice) {
   if (addOnPrice <= 0) {
-
-
-    currentProfile.limit_notes = limits.limit_notes;
-    currentProfile.limit_chars = limits.limit_chars;
-    currentProfile.limit_groups = limits.limit_groups;
-    currentProfile.limit_messages = limits.limit_messages;
-    currentProfile.custom_perks = perks;
-    currentProfile.custom_price = 0;
-
-    const { error } = await db.from('profiles').update({
-      limit_notes: limits.limit_notes,
-      limit_chars: limits.limit_chars,
-      limit_groups: limits.limit_groups,
-      limit_messages: limits.limit_messages,
-      custom_perks: perks,
-      custom_price: 0
-    }).eq('id', currentUser.id);
-
+    // Доплата не нужна: выбранные значения не превышают тариф, значит это возврат к базовым
+    // лимитам плана. Локальный профиль обновляем только после успешного ответа сервера.
+    const epoch = authEpoch;
+    const { error } = await clearMyAddons();
+    if (epoch !== authEpoch) return;
     if (error) {
       await showAlert('Не удалось сохранить лимиты: ' + error.message, 'ошибка сохранения');
       return;
     }
+    await refreshCurrentProfile();
 
     showPaymentSuccess({ name: 'Кастомный план', price: 0 }, 'Лимиты обновлены — доплата не требовалась.');
     renderSidebar();
@@ -2550,45 +2794,47 @@ async function confirmCustomPayment(limits, perks, addOnPrice) {
     return;
   }
 
-  const label = await buildYoomoneyCheckout({
+  const order = await buildYoomoneyCheckout({
     amount: addOnPrice,
     kind: 'custom',
     customPayload: { limits, perks },
   });
-  if (!label) return;
-  redirectToYoomoney(label, addOnPrice, 'Тетрадь — докупка лимитов');
+  if (!order) return;
+  redirectToYoomoney(order.label, order.amount, 'Тетрадь — докупка лимитов');
 }
 
 
 
-function generatePaymentLabel() {
-
-
-
-  return 'pay_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
-}
-
+// Заказ создаёт сервер (RPC create_payment_order): он сам считает сумму по своим тарифам,
+// проверяет состав докупки и выдаёт непредсказуемый label. Клиент больше не может записать
+// в payments произвольные amount/status/custom_payload. Сумма из клиента передаётся
+// только для сверки — при расхождении оплата не начинается.
 async function buildYoomoneyCheckout({ amount, kind, planKey, customPayload }) {
-  const label = generatePaymentLabel();
-
-  const { error } = await db.from('payments').insert({
-    user_id: currentUser.id,
-    label,
-    kind,
-    plan_key: planKey || null,
-    custom_payload: customPayload || null,
-    amount,
-    status: 'pending',
+  const { data, error } = await db.rpc('create_payment_order', {
+    p_kind: kind,
+    p_plan_key: planKey || null,
+    p_custom_payload: customPayload || null,
+    p_client_amount: amount,
   });
 
-  if (error) {
-    await showAlert('Не удалось создать заказ на оплату: ' + error.message + '\n\nПроверьте, что в базе создана таблица payments (см. инструкцию в исходном коде страницы).', 'ошибка');
-    logEvent('payment', 'Ошибка создания заказа: ' + error.message, { kind, planKey, amount });
+  if (error || !data || !data.label) {
+    const missing = isMissingRpc(error);
+    const reason = missing
+      ? 'на сервере не применена миграция создания заказов (create_payment_order).'
+      : (error ? error.message : 'пустой ответ сервера');
+    await showAlert('Не удалось создать заказ на оплату: ' + reason, 'ошибка');
+    logEvent('payment', 'Ошибка создания заказа: ' + (error ? error.message : 'пустой ответ'), { kind, planKey });
     return null;
   }
 
-  logEvent('payment', 'Создан заказ на оплату', { label, kind, planKey, amount });
-  return label;
+  if (Number(data.amount) !== Number(amount)) {
+    await showAlert('Стоимость изменилась (' + data.amount + ' ₽ вместо ' + amount + ' ₽). Обновите страницу и повторите.', 'цена изменилась');
+    logEvent('payment', 'Расхождение суммы клиента и сервера', { kind, planKey, client: amount, server: data.amount });
+    return null;
+  }
+
+  logEvent('payment', 'Создан заказ на оплату', { label: data.label, kind, planKey, amount: data.amount });
+  return { label: data.label, amount: Number(data.amount) };
 }
 
 function redirectToYoomoney(label, amount, description) {
@@ -2614,6 +2860,9 @@ async function checkReturnFromYoomoney() {
   history.replaceState(null, '', window.location.pathname);
 
   if (!currentUser) return;
+  if (!/^[A-Za-z0-9_-]{6,80}$/.test(label)) return;
+  const epoch = authEpoch;
+  const uid = currentUser.id;
 
   openPricing();
   const card = document.getElementById('pricing-card');
@@ -2628,11 +2877,12 @@ async function checkReturnFromYoomoney() {
 
   const maxAttempts = 15;
   for (let i = 0; i < maxAttempts; i++) {
-    const { data: payment } = await db.from('payments').select('*').eq('label', label).single();
+    const { data: payment } = await db.from('payments').select('*').eq('label', label).eq('user_id', uid).maybeSingle();
+    if (epoch !== authEpoch) return;   // пока ждали подтверждение, сменили аккаунт
 
     if (payment && payment.status === 'paid') {
-      const { data: freshProfile } = await db.from('profiles').select('*').eq('id', currentUser.id).single();
-      if (freshProfile) currentProfile = freshProfile;
+      await refreshCurrentProfile();
+      if (epoch !== authEpoch) return;
 
       const p = payment.kind === 'plan'
         ? PLANS[payment.plan_key]
@@ -2655,6 +2905,7 @@ async function checkReturnFromYoomoney() {
     }
 
     await new Promise(r => setTimeout(r, 2000));
+    if (epoch !== authEpoch) return;
   }
 
   card.innerHTML = `
@@ -2697,9 +2948,10 @@ function luhnValid(digits) {
 
 async function confirmPayment(planKey) {
   const p = PLANS[planKey];
-  const label = await buildYoomoneyCheckout({ amount: p.price, kind: 'plan', planKey });
-  if (!label) return;
-  redirectToYoomoney(label, p.price, `Тетрадь — план «${p.name}»`);
+  if (!p || !(p.price > 0)) return;
+  const order = await buildYoomoneyCheckout({ amount: p.price, kind: 'plan', planKey });
+  if (!order) return;
+  redirectToYoomoney(order.label, order.amount, `Тетрадь — план «${p.name}»`);
 }
 
 
@@ -2721,22 +2973,35 @@ function showPaymentSuccess(p, subMessage) {
 
 
 
+// Переход на Free выполняет сервер (RPC downgrade_to_free): прямая запись поля plan из
+// браузера означала бы, что любой пользователь может выставить себе платный план.
 async function setUserPlan(planKey) {
-  const clearFields = { plan: planKey, custom_perks: null, custom_price: 0 };
-  LIMIT_OVERRIDE_FIELDS.forEach(f => { clearFields[f.column] = null; });
-  // локальный профиль меняем только после успешной записи
-  const { error } = await db.from('profiles').update(clearFields).eq('id', currentUser.id);
+  if (planKey !== 'free') {
+    await showAlert('Платный план подключается только через оплату.', 'ошибка');
+    return false;
+  }
+  const epoch = authEpoch;
+  let { error } = await db.rpc('downgrade_to_free');
+  if (isMissingRpc(error)) {
+    const clearFields = { plan: 'free', custom_perks: null, custom_price: 0 };
+    LIMIT_OVERRIDE_FIELDS.forEach(f => { clearFields[f.column] = null; });
+    ({ error } = await db.from('profiles').update(clearFields).eq('id', currentUser.id));
+  }
+  if (epoch !== authEpoch) return false;
   if (error) {
     await showAlert('Не удалось сменить план: ' + error.message, 'ошибка');
     return false;
   }
-  Object.assign(currentProfile, clearFields);
+  // локальный профиль обновляем только по данным сервера
+  await refreshCurrentProfile();
   return true;
 }
 
 
 
 let adminLookupResult = null;
+let adminSearchSeq = 0;       // номер последнего поиска: запоздавшие ответы отбрасываются
+let adminLogsSeq = 0;
 let adminLookupNotesExpanded = false;
 let adminPanelTab = 'users';
 let adminLogsCategory = 'all';
@@ -2751,6 +3016,8 @@ function openAdminPanel() {
 function closeAdminPanel() {
   document.getElementById('admin-modal').classList.add('hidden');
   document.body.style.overflow = '';
+  adminSearchSeq++;
+  adminLogsSeq++;
   adminLookupResult = null;
   adminLookupNotesExpanded = false;
 }
@@ -2819,9 +3086,12 @@ function setAdminLogsCategory(cat) {
 }
 
 async function loadAdminLogs() {
+  const seq = ++adminLogsSeq;
+  const epoch = authEpoch;
   let query = db.from('event_logs').select('*').order('created_at', { ascending: false }).limit(200);
   if (adminLogsCategory !== 'all') query = query.eq('category', adminLogsCategory);
   const { data, error } = await query;
+  if (seq !== adminLogsSeq || epoch !== authEpoch) return;
 
   const listEl = document.getElementById('admin-logs-list');
   if (!listEl) return;
@@ -2839,6 +3109,7 @@ async function loadAdminLogs() {
   let namesById = {};
   if (userIds.length > 0) {
     const { data: profiles } = await db.from('profiles').select('id, display_name').in('id', userIds);
+    if (seq !== adminLogsSeq || epoch !== authEpoch) return;
     (profiles || []).forEach(p => { namesById[p.id] = p.display_name; });
   }
 
@@ -2853,14 +3124,14 @@ function logRowHtml(row, namesById) {
   const metaStr = row.meta ? JSON.stringify(row.meta) : '';
   const userName = row.user_id ? ((namesById || {})[row.user_id] || null) : null;
   return `
-    <div class="admin-log-row admin-log-cat-${escapeHtml(row.category)}">
+    <div class="admin-log-row admin-log-cat-${escapeHtml(String(row.category).replace(/[^a-z_]/gi, ''))}">
       <div class="admin-log-row-top">
         <span class="admin-log-time">${time}</span>
         <span class="admin-log-cat">${escapeHtml(catLabel)}</span>
         <span class="admin-log-source">${row.source === 'webhook' ? 'webhook' : 'клиент'}</span>
       </div>
       <div class="admin-log-message">${escapeHtml(row.message)}</div>
-      ${row.user_id ? `<div class="admin-log-user" onclick="selectAdminUserById('${row.user_id}')">пользователь: ${userName ? escapeHtml(userName) + ' · ' : ''}${escapeHtml(row.user_id)}</div>` : ''}
+      ${row.user_id ? `<div class="admin-log-user" ${safeId(row.user_id) ? `onclick="selectAdminUserById('${safeId(row.user_id)}')"` : ''}>пользователь: ${userName ? escapeHtml(userName) + ' · ' : ''}${escapeHtml(row.user_id)}</div>` : ''}
       ${metaStr ? `<div class="admin-log-meta">${escapeHtml(metaStr)}</div>` : ''}
     </div>
   `;
@@ -2870,20 +3141,29 @@ async function runAdminSearch() {
   const query = document.getElementById('admin-search-input').value.trim();
   if (!query) return;
 
+  const seq = ++adminSearchSeq;
+  const epoch = authEpoch;
   const resultEl = document.getElementById('admin-result');
   resultEl.innerHTML = `<div class="admin-empty loading-pulse">Поиск…</div>`;
 
 
   const looksLikeUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(query);
 
-  let rows = [];
+  let res;
   if (looksLikeUuid) {
-    const { data } = await db.from('profiles').select('*').eq('id', query).limit(1);
-    rows = data || [];
+    res = await db.from('profiles').select('*').eq('id', query).limit(1);
   } else {
-    const { data } = await db.from('profiles').select('*').ilike('display_name', `%${query}%`).limit(10);
-    rows = data || [];
+    // % и _ в имени — обычные символы, а не шаблон
+    const pattern = query.replace(/[\\%_]/g, m => '\\' + m);
+    res = await db.from('profiles').select('*').ilike('display_name', `%${pattern}%`).limit(10);
   }
+  if (seq !== adminSearchSeq || epoch !== authEpoch) return;   // пришёл устаревший ответ
+
+  if (res.error) {
+    resultEl.innerHTML = `<div class="admin-error">Ошибка поиска: ${escapeHtml(res.error.message)}</div>`;
+    return;
+  }
+  const rows = res.data || [];
 
   if (rows.length === 0) {
     resultEl.innerHTML = `<div class="admin-empty">Никого не найдено. Проверьте ID или имя.</div>`;
@@ -2897,16 +3177,24 @@ async function runAdminSearch() {
 
 
   resultEl.innerHTML = rows.map(r => `
-    <div class="recent-group-item" onclick="selectAdminUserById('${r.id}')">
+    <div class="recent-group-item" onclick="selectAdminUserById('${safeId(r.id)}')">
       <span class="recent-group-name">${escapeHtml(r.display_name || '(без имени)')}</span>
-      <span class="recent-group-owner-tag" style="border-color:var(--line); color:var(--text-dim);">${r.plan || 'free'}</span>
+      <span class="recent-group-owner-tag" style="border-color:var(--line); color:var(--text-dim);">${escapeHtml(r.plan || 'free')}</span>
     </div>
   `).join('');
 }
 
 async function selectAdminUserById(id) {
-  const { data } = await db.from('profiles').select('*').eq('id', id).single();
-  if (data) await loadAdminUser(data);
+  const seq = ++adminSearchSeq;
+  const epoch = authEpoch;
+  const { data, error } = await db.from('profiles').select('*').eq('id', id).single();
+  if (seq !== adminSearchSeq || epoch !== authEpoch) return;
+  if (error || !data) {
+    const el = document.getElementById('admin-result');
+    if (el) el.innerHTML = `<div class="admin-error">Не удалось загрузить пользователя${error ? ': ' + escapeHtml(error.message) : ''}</div>`;
+    return;
+  }
+  await loadAdminUser(data);
 }
 
 async function loadAdminUser(profileRow) {
@@ -2920,13 +3208,23 @@ async function renderAdminUserCard() {
   if (!resultEl || !adminLookupResult) return;
 
   const u = adminLookupResult;
+  const uid = safeId(u.id);
+  const epoch = authEpoch;
   resultEl.innerHTML = `<div class="admin-empty loading-pulse">Загрузка данных…</div>`;
 
-  const [{ count: noteCount }, { count: groupCount }, { data: noteRows }] = await Promise.all([
+  const [noteCountRes, groupCountRes, noteRowsRes] = await Promise.all([
     db.from('notes').select('id', { count: 'exact', head: true }).eq('user_id', u.id),
     db.from('groups').select('id', { count: 'exact', head: true }).eq('owner_id', u.id),
     db.from('notes').select('id, title, updated_at').eq('user_id', u.id).order('updated_at', { ascending: false }).limit(20)
   ]);
+  // пока грузилось, карточку закрыли/открыли другую, либо сменился аккаунт
+  if (epoch !== authEpoch || adminLookupResult !== u) return;
+  const failed = noteCountRes.error || groupCountRes.error || noteRowsRes.error;
+  if (failed) {
+    resultEl.innerHTML = `<div class="admin-error">Не удалось загрузить данные пользователя: ${escapeHtml(failed.message)}</div>`;
+    return;
+  }
+  const noteCount = noteCountRes.count, groupCount = groupCountRes.count, noteRows = noteRowsRes.data;
 
   const plan = getEffectivePlan(u);
   const planOrder = ['free', 's', 'm', 'l'];
@@ -2947,7 +3245,7 @@ async function renderAdminUserCard() {
         <span class="admin-user-name">${escapeHtml(u.display_name || '(без имени)')}</span>
         <span class="plan-badge ${plan.badgeClass}">${plan.name.toLowerCase()}</span>
       </div>
-      <div class="admin-user-id">id: ${u.id}</div>
+      <div class="admin-user-id">id: ${escapeHtml(u.id)}</div>
 
       <div class="admin-stat-grid">
         <div class="admin-stat">
@@ -2969,7 +3267,7 @@ async function renderAdminUserCard() {
         ${planOrder.map(key => `
           <button type="button" class="admin-plan-btn${u.plan === key ? ' current' : ''}"
             ${u.plan === key ? 'disabled' : ''}
-            onclick="adminSetPlan('${u.id}', '${key}')">${PLANS[key].name}</button>
+            onclick="adminSetPlan('${uid}', '${key}')">${PLANS[key].name}</button>
         `).join('')}
       </div>
 
@@ -2993,13 +3291,13 @@ async function renderAdminUserCard() {
                 oninput="syncAdminLimitInputs('${f.column}', this.value, 'range')">
               <input type="number" id="admin-limit-number-${f.column}" min="${f.min}" max="${sliderMax}" step="${f.step}" value="${currentVal}"
                 oninput="syncAdminLimitInputs('${f.column}', this.value, 'number')">
-              <button type="button" class="admin-limit-reset-btn" ${isOverridden ? '' : 'disabled'} onclick="adminResetLimitField('${u.id}', '${f.column}')">сбросить</button>
+              <button type="button" class="admin-limit-reset-btn" ${isOverridden ? '' : 'disabled'} onclick="adminResetLimitField('${uid}', '${f.column}')">сбросить</button>
             </div>
           </div>
         `;
       }).join('')}
       <div class="admin-plan-btns">
-        <button type="button" class="admin-plan-btn" style="border-color:var(--accent); color:var(--accent);" onclick="adminSaveLimitOverrides('${u.id}')">Сохранить лимиты</button>
+        <button type="button" class="admin-plan-btn" style="border-color:var(--accent); color:var(--accent);" onclick="adminSaveLimitOverrides('${uid}')">Сохранить лимиты</button>
       </div>
 
       <div class="admin-section-title">Доступ</div>
@@ -3008,7 +3306,7 @@ async function renderAdminUserCard() {
           <div class="admin-toggle-label">Блокировка входа</div>
           <div class="admin-toggle-sub">Заблокированный пользователь не сможет пользоваться аккаунтом.</div>
         </div>
-        <button type="button" class="admin-toggle-btn${u.banned ? ' on' : ''}" onclick="adminToggleBan('${u.id}', ${!u.banned})">
+        <button type="button" class="admin-toggle-btn${u.banned ? ' on' : ''}" onclick="adminToggleBan('${uid}', ${!u.banned})">
           ${u.banned ? 'разблокировать' : 'заблокировать'}
         </button>
       </div>
@@ -3017,7 +3315,7 @@ async function renderAdminUserCard() {
           <div class="admin-toggle-label">Права администратора</div>
           <div class="admin-toggle-sub">Доступ к этой панели для данного пользователя.</div>
         </div>
-        <button type="button" class="admin-toggle-btn${u.is_admin ? ' admin-on' : ''}" ${isSelf ? 'disabled title="Нельзя снять доступ у самого себя"' : ''} onclick="adminToggleAdmin('${u.id}', ${!u.is_admin})">
+        <button type="button" class="admin-toggle-btn${u.is_admin ? ' admin-on' : ''}" ${isSelf ? 'disabled title="Нельзя снять доступ у самого себя"' : ''} onclick="adminToggleAdmin('${uid}', ${!u.is_admin})">
           ${u.is_admin ? 'снять права' : 'сделать админом'}
         </button>
       </div>
@@ -3026,25 +3324,32 @@ async function renderAdminUserCard() {
       ${notesHtml}
 
       <div class="admin-danger-row">
-        <button type="button" class="admin-danger-btn" onclick="adminResetPlanConfirm('${u.id}')">Сбросить план на Free</button>
+        <button type="button" class="admin-danger-btn" onclick="adminResetPlanConfirm('${uid}')">Сбросить план на Free</button>
       </div>
     </div>
   `;
 }
 
+// Карточку могли закрыть или открыть другую, пока шёл запрос
+function adminCardIs(userId) {
+  return !!adminLookupResult && String(adminLookupResult.id) === String(userId);
+}
+
 async function adminSetPlan(userId, planKey) {
+  const epoch = authEpoch;
   const { error } = await db.from('profiles').update({ plan: planKey }).eq('id', userId);
+  if (epoch !== authEpoch) return;
   if (error) {
     await showAlert('Не удалось изменить план: ' + error.message + '\n\nПроверьте, что в Supabase настроена RLS-политика, разрешающая администраторам обновлять чужие профили.', 'ошибка доступа');
     return;
   }
-  adminLookupResult.plan = planKey;
+  if (adminCardIs(userId)) adminLookupResult.plan = planKey;
   if (userId === currentUser.id) {
     currentProfile.plan = planKey;
     renderSidebar();
     renderEditor();
   }
-  await renderAdminUserCard();
+  if (adminCardIs(userId)) await renderAdminUserCard();
 }
 
 
@@ -3070,33 +3375,37 @@ async function adminSaveLimitOverrides(userId) {
     updates[f.column] = Number.isNaN(num) ? null : num;
   });
 
+  const epoch = authEpoch;
   const { error } = await db.from('profiles').update(updates).eq('id', userId);
+  if (epoch !== authEpoch) return;
   if (error) {
     await showAlert('Не удалось сохранить лимиты: ' + error.message + '\n\nПроверьте, что в таблице profiles есть колонки limit_notes, limit_chars, limit_groups, limit_messages.', 'ошибка сохранения');
     return;
   }
-  Object.assign(adminLookupResult, updates);
+  if (adminCardIs(userId)) Object.assign(adminLookupResult, updates);
   if (userId === currentUser.id) {
     Object.assign(currentProfile, updates);
     renderSidebar();
     renderEditor();
   }
-  await renderAdminUserCard();
+  if (adminCardIs(userId)) await renderAdminUserCard();
 }
 
 async function adminResetLimitField(userId, column) {
+  const epoch = authEpoch;
   const { error } = await db.from('profiles').update({ [column]: null }).eq('id', userId);
+  if (epoch !== authEpoch) return;
   if (error) {
     await showAlert('Не удалось сбросить лимит: ' + error.message, 'ошибка сохранения');
     return;
   }
-  adminLookupResult[column] = null;
+  if (adminCardIs(userId)) adminLookupResult[column] = null;
   if (userId === currentUser.id) {
     currentProfile[column] = null;
     renderSidebar();
     renderEditor();
   }
-  await renderAdminUserCard();
+  if (adminCardIs(userId)) await renderAdminUserCard();
 }
 
 async function adminResetPlanConfirm(userId) {
@@ -3106,26 +3415,38 @@ async function adminResetPlanConfirm(userId) {
 }
 
 async function adminToggleBan(userId, nextValue) {
+  if (nextValue && userId === currentUser.id) {
+    await showAlert('Нельзя заблокировать самого себя.', 'ошибка');
+    return;
+  }
+  const epoch = authEpoch;
   const { error } = await db.from('profiles').update({ banned: nextValue }).eq('id', userId);
+  if (epoch !== authEpoch) return;
   if (error) {
     await showAlert('Не удалось изменить статус блокировки: ' + error.message, 'ошибка доступа');
     return;
   }
-  adminLookupResult.banned = nextValue;
-  await renderAdminUserCard();
+  if (adminCardIs(userId)) {
+    adminLookupResult.banned = nextValue;
+    await renderAdminUserCard();
+  }
 }
 
 async function adminToggleAdmin(userId, nextValue) {
   if (userId === currentUser.id) return;
   const ok = await showConfirm(nextValue ? 'Выдать этому пользователю права администратора?' : 'Забрать права администратора у этого пользователя?', { eyebrow: 'права доступа', confirmLabel: 'Подтвердить', danger: !nextValue });
   if (!ok) return;
+  const epoch = authEpoch;
   const { error } = await db.from('profiles').update({ is_admin: nextValue }).eq('id', userId);
+  if (epoch !== authEpoch) return;
   if (error) {
     await showAlert('Не удалось изменить права: ' + error.message, 'ошибка доступа');
     return;
   }
-  adminLookupResult.is_admin = nextValue;
-  await renderAdminUserCard();
+  if (adminCardIs(userId)) {
+    adminLookupResult.is_admin = nextValue;
+    await renderAdminUserCard();
+  }
 }
 
 
@@ -3173,6 +3494,7 @@ async function renderGroupsPanel() {
 
 
 
+  const epoch = authEpoch;
   const [owned, recentResult] = await Promise.all([
     getOwnedGroupsCount(),
     db
@@ -3183,6 +3505,7 @@ async function renderGroupsPanel() {
       .limit(30),
   ]);
 
+  if (epoch !== authEpoch) return;   // за время запроса сменился аккаунт
   const limitReached = owned >= plan.groupLimit;
   const recentRows = recentResult.data;
   if (recentResult.error) {
@@ -3194,20 +3517,20 @@ async function renderGroupsPanel() {
   const myGroups = recent.filter(r => r.groups.owner_id === currentUser.id);
   const otherGroups = recent.filter(r => r.groups.owner_id !== currentUser.id);
 
+  // Данные группы в inline-обработчики не подставляем (название задаёт пользователь —
+  // это был путь для XSS). Обработчики навешиваются ниже по индексу в groupRefs.
+  const groupRefs = [];
   function renderGroupItem(r, i) {
     const g = r.groups;
     const isProtected = !!g.has_password;
     const isOwn = g.owner_id === currentUser.id;
     const delay = Math.min(i * 30, 240);
-    const alreadyUnlocked = isProtected && unlockedGroupIds.has(g.id);
-    const clickHandler = (isProtected && !alreadyUnlocked)
-      ? `openGroupPrompt('${g.name_lower.replace(/'/g,"\\'")}', '${escapeHtml(g.name).replace(/'/g,"\\'")}')`
-      : `enterOpenGroup('${g.id}')`;
+    const ref = groupRefs.push(g) - 1;
     return `
-      <div class="recent-group-item${g.name_lower === activeGroupName ? ' active' : ''}" style="animation-delay:${delay}ms" onclick="${clickHandler}">
+      <div class="recent-group-item${g.name_lower === activeGroupName ? ' active' : ''}" style="animation-delay:${delay}ms" data-gref="${ref}" role="button" tabindex="0">
         <span class="recent-group-name">${escapeHtml(g.name)}</span>
         ${!isProtected ? '<span class="group-lock-tag">без пароля</span>' : ''}
-        ${isOwn ? `<button type="button" class="recent-group-delete" title="Удалить группу" aria-label="Удалить группу" onclick="event.stopPropagation(); deleteGroup('${g.id}', '${escapeHtml(g.name).replace(/'/g,"\\'")}')">✕</button>` : ''}
+        ${isOwn ? `<button type="button" class="recent-group-delete" title="Удалить группу" aria-label="Удалить группу">✕</button>` : ''}
       </div>`;
   }
 
@@ -3277,6 +3600,21 @@ async function renderGroupsPanel() {
       </div>
     </div>
   `;
+
+  panel.querySelectorAll('.recent-group-item[data-gref]').forEach(el => {
+    const g = groupRefs[Number(el.dataset.gref)];
+    if (!g) return;
+    const open = () => {
+      if (g.has_password && !unlockedGroupIds.has(g.id)) openGroupPrompt(g.name_lower, g.name);
+      else enterOpenGroup(g.id);
+    };
+    el.addEventListener('click', open);
+    el.addEventListener('keydown', (ev) => {
+      if ((ev.key === 'Enter' || ev.key === ' ') && ev.target === el) { ev.preventDefault(); open(); }
+    });
+    const del = el.querySelector('.recent-group-delete');
+    if (del) del.addEventListener('click', (ev) => { ev.stopPropagation(); deleteGroup(g.id, g.name); });
+  });
 }
 
 function toggleNewGroupPasswordField() {
@@ -3293,12 +3631,25 @@ function openGroupPrompt(nameLower, displayName) {
 }
 
 async function enterOpenGroup(groupId) {
-  const { error: recentErr } = await db.from('recent_groups').upsert({ user_id: currentUser.id, group_id: groupId, last_visited: new Date().toISOString() });
+  const epoch = authEpoch;
+  // Только обновляем существующую запись о членстве. Раньше здесь был upsert: он позволял
+  // «вступить» в любую группу по её id из консоли, минуя пароль.
+  const { data: touched, error: recentErr } = await db.from('recent_groups')
+    .update({ last_visited: new Date().toISOString() })
+    .eq('user_id', currentUser.id).eq('group_id', groupId)
+    .select('group_id');
+  if (epoch !== authEpoch) return;
   if (recentErr) {
     await showAlert('Не удалось открыть группу: ' + recentErr.message, 'ошибка');
     return;
   }
+  if (!touched || touched.length === 0) {
+    await showAlert('Вы больше не состоите в этой группе. Войдите в неё снова по названию и паролю.', 'группа недоступна');
+    await renderGroupsPanel();
+    return;
+  }
   const { data: g, error: gErr } = await db.from('groups').select(GROUP_COLUMNS).eq('id', groupId).maybeSingle();
+  if (epoch !== authEpoch) return;
   if (gErr) {
     await showAlert('Не удалось загрузить группу: ' + gErr.message, 'ошибка');
     return;
@@ -3340,10 +3691,12 @@ async function createGroup() {
   if (wantsPassword && (!password || password.length < 4)) { showGroupFormError('create-group-error', 'Пароль группы должен содержать не менее 4 символов.'); return; }
 
   // пароль хешируется на сервере (bcrypt через pgcrypto)
+  const epoch = authEpoch;
   const { data, error } = await db.rpc('create_group', {
     p_name: name,
     p_password: wantsPassword ? password : null,
   });
+  if (epoch !== authEpoch) return;
 
   if (error) {
     showGroupFormError('create-group-error', error.code === '23505' ? 'Группа с таким названием уже существует.' : error.message);
@@ -3374,7 +3727,16 @@ async function joinGroup() {
   if (!name) { showGroupFormError('join-group-error', 'Введите название группы.'); return; }
 
   // проверка пароля выполняется на сервере
-  const { data: res, error } = await db.rpc('join_group', { p_name: name, p_password: password || null });
+  const epoch = authEpoch;
+  // join_group_and_record проверяет пароль и записывает членство на сервере одной операцией.
+  // Если миграция не применена — прежний путь (join_group + запись из клиента).
+  let legacy = false;
+  let { data: res, error } = await db.rpc('join_group_and_record', { p_name: name, p_password: password || null });
+  if (isMissingRpc(error)) {
+    legacy = true;
+    ({ data: res, error } = await db.rpc('join_group', { p_name: name, p_password: password || null }));
+  }
+  if (epoch !== authEpoch) return;
 
   if (error) {
     showGroupFormError('join-group-error', 'Не удалось войти в группу: ' + error.message);
@@ -3391,10 +3753,12 @@ async function joinGroup() {
 
   const g = { id: res.group_id, name_lower: res.name_lower };
 
-  const { error: recentErr } = await db.from('recent_groups').upsert({ user_id: currentUser.id, group_id: g.id, last_visited: new Date().toISOString() });
-  if (recentErr) {
-    showGroupFormError('join-group-error', 'Не удалось добавить группу в список: ' + recentErr.message);
-    return;
+  if (legacy) {
+    const { error: recentErr } = await db.from('recent_groups').upsert({ user_id: currentUser.id, group_id: g.id, last_visited: new Date().toISOString() });
+    if (recentErr) {
+      showGroupFormError('join-group-error', 'Не удалось добавить группу в список: ' + recentErr.message);
+      return;
+    }
   }
 
   unlockedGroupIds.add(g.id);
@@ -3416,7 +3780,9 @@ async function deleteGroup(groupId, groupName) {
 
   // Всё удаление (сообщения, recent_groups, сама группа) выполняется в одной
   // транзакции на сервере: при любой ошибке откатывается целиком.
+  const epoch = authEpoch;
   const { data: res, error } = await db.rpc('delete_group', { p_group_id: String(groupId) });
+  if (epoch !== authEpoch) return;
 
   if (error || !res || res.status !== 'ok') {
     const reason = error ? error.message : 'у вас нет прав на это действие';
@@ -3425,7 +3791,7 @@ async function deleteGroup(groupId, groupName) {
   }
 
   logEvent('user_action', 'Удалена группа', { group_id: groupId, name: groupName });
-  if (activeGroupId === groupId) { activeGroupName = null; activeGroupId = null; }
+  if (String(activeGroupId) === String(groupId)) { activeGroupName = null; activeGroupId = null; groupManageOpen = false; }
   await renderGroupsPanel();
   await renderGroupArea();
   showMobileList();
@@ -3527,17 +3893,26 @@ async function buildGroupManagePanel(g, posts) {
   membersLabel.textContent = 'участники';
   membersWrap.appendChild(membersLabel);
 
+  // Список участников берём с сервера (включая тех, кто ни разу не писал: иначе владелец
+  // не мог бы закрыть им доступ). Если RPC ещё нет — прежний способ, по авторам сообщений.
   const membersById = new Map();
-  posts.forEach(p => {
-    if (p.author_id === g.owner_id) return;
-    if (!membersById.has(p.author_id)) membersById.set(p.author_id, p.author_name);
-  });
+  let emptyMembersText = 'Пока никто из участников не писал в группу.';
+  const { data: memberRows, error: memberErr } = await db.rpc('list_group_members', { p_group_id: String(g.id) });
+  if (!memberErr && Array.isArray(memberRows)) {
+    memberRows.forEach(m => { if (m.user_id !== g.owner_id) membersById.set(m.user_id, m.display_name || '(без имени)'); });
+    emptyMembersText = 'В группе пока нет других участников.';
+  } else {
+    posts.forEach(p => {
+      if (p.author_id === g.owner_id) return;
+      if (!membersById.has(p.author_id)) membersById.set(p.author_id, p.author_name);
+    });
+  }
 
   const memberList = document.createElement('div');
   memberList.className = 'group-member-list';
 
   if (membersById.size === 0) {
-    memberList.innerHTML = `<div class="group-member-empty">Пока никто из участников не писал в группу.</div>`;
+    memberList.innerHTML = `<div class="group-member-empty">${escapeHtml(emptyMembersText)}</div>`;
   } else {
     membersById.forEach((name, authorId) => {
       const row = document.createElement('div');
@@ -3604,21 +3979,35 @@ async function removeGroupMember(g, authorId, authorName) {
   );
   if (!ok) return;
 
+  const epoch = authEpoch;
+  // Сообщения и членство удаляются одной транзакцией на сервере
+  const { data: res, error } = await db.rpc('remove_group_member', { p_group_id: String(g.id), p_user_id: authorId });
+  if (epoch !== authEpoch) return;
+
+  if (!error) {
+    if (!res || res.status !== 'ok') {
+      await showAlert('Не удалось удалить участника: нет прав на это действие.', 'ошибка');
+      return;
+    }
+    await renderGroupArea();
+    return;
+  }
+  if (!isMissingRpc(error)) {
+    await showAlert('Не удалось удалить участника: ' + error.message, 'ошибка');
+    return;
+  }
+
+  // миграция не применена — прежний путь (две независимые операции)
   const [postsRes, recentRes] = await Promise.all([
     db.from('group_posts').delete().eq('group_id', g.id).eq('author_id', authorId).select('id'),
     db.from('recent_groups').delete().eq('group_id', g.id).eq('user_id', authorId).select('user_id'),
   ]);
-
+  if (epoch !== authEpoch) return;
   if (postsRes.error || recentRes.error) {
-    await showAlert('Не удалось удалить участника: ' + (postsRes.error?.message || recentRes.error?.message), 'ошибка');
+    await showAlert('Не удалось удалить участника (часть данных могла быть удалена — повторите действие): ' + (postsRes.error?.message || recentRes.error?.message), 'ошибка');
+    await renderGroupArea();
     return;
   }
-
-  if ((postsRes.data || []).length === 0) {
-    await showAlert('Участник не был удалён: недостаточно прав на удаление его сообщений. Проверьте политику доступа (RLS) для таблицы group_posts — владельцу группы нужно разрешить удаление чужих постов в своей группе.', 'ошибка');
-    return;
-  }
-
   await renderGroupArea();
 }
 
@@ -3632,14 +4021,15 @@ async function renderGroupArea() {
 
   area.innerHTML = `<div class="editor-empty"><div class="editor-empty-title loading-pulse">Загрузка…</div></div>`;
 
-
-
-
+  const epoch = authEpoch;
+  const requestedGroupId = activeGroupId;
   const [groupResult, postsResult, myCount] = await Promise.all([
-    db.from('groups').select(GROUP_COLUMNS).eq('id', activeGroupId).single(),
-    db.from('group_posts').select('*').eq('group_id', activeGroupId).order('created_at', { ascending: true }),
-    getMyMessageCountInGroup(activeGroupId),
+    db.from('groups').select(GROUP_COLUMNS).eq('id', requestedGroupId).single(),
+    db.from('group_posts').select('*').eq('group_id', requestedGroupId).order('created_at', { ascending: true }),
+    getMyMessageCountInGroup(requestedGroupId),
   ]);
+  // аккаунт или открытая группа сменились, пока шёл запрос — ответ устарел
+  if (epoch !== authEpoch || requestedGroupId !== activeGroupId) return;
 
   if (groupResult.error || postsResult.error) {
     const msg = (groupResult.error || postsResult.error).message;
@@ -3776,24 +4166,32 @@ async function renderGroupArea() {
   feed.style.scrollBehavior = prevScrollBehavior;
 }
 
+let sendingPost = false;
 async function sendGroupPost(groupId, textarea) {
   const text = textarea.value.trim();
-  if (!text) return;
+  if (!text || sendingPost) return;
+  sendingPost = true;
+  try {
+    const epoch = authEpoch;
+    const count = await getMyMessageCountInGroup(groupId);
+    if (epoch !== authEpoch) return;
+    if (count >= getMessageLimit()) { await renderGroupArea(); return; }
 
-  const count = await getMyMessageCountInGroup(groupId);
-  if (count >= getMessageLimit()) { await renderGroupArea(); return; }
+    const { error } = await db.from('group_posts').insert({
+      group_id: groupId,
+      author_id: currentUser.id,
+      author_name: currentProfile.display_name,
+      text
+    });
+    if (epoch !== authEpoch) return;
 
-  const { error } = await db.from('group_posts').insert({
-    group_id: groupId,
-    author_id: currentUser.id,
-    author_name: currentProfile.display_name,
-    text
-  });
+    if (error) { await showAlert('Не удалось отправить сообщение: ' + error.message, 'ошибка'); return; }
 
-  if (error) { await showAlert('Не удалось отправить сообщение: ' + error.message, 'ошибка'); return; }
-
-  textarea.value = '';
-  await renderGroupArea();
+    textarea.value = '';
+    await renderGroupArea();
+  } finally {
+    sendingPost = false;
+  }
 }
 
 function formatGroupTime(ts) {
@@ -3888,9 +4286,15 @@ function setupSidebarResize() {
     switchTab('reset');
   }
 
-  const { data } = await db.auth.getSession();
-  if (data.session && !passwordRecoveryLinkPresent()) {
-    await enterApp(data.session.user);
-    await checkReturnFromYoomoney();
+  try {
+    const { data, error } = await db.auth.getSession();
+    if (error) throw error;
+    if (data.session && !passwordRecoveryLinkPresent()) {
+      const entered = await enterApp(data.session.user);
+      if (entered) await checkReturnFromYoomoney();
+    }
+  } catch (err) {
+    console.error('Session restore failed:', err);
+    showError('Не удалось восстановить сессию: ' + translateAuthError(err && err.message ? err.message : 'ошибка сети') + ' Войдите заново.');
   }
 })();
