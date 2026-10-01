@@ -172,6 +172,97 @@ function safeId(v) {
 // Ошибка «функция не найдена» — миграция на сервере ещё не применена (совместимость при раскатке)
 function isMissingRpc(e) { return !!e && (e.code === 'PGRST202' || e.code === '42883'); }
 
+// ===== Шифрование (tetrad-crypto.js). Тексты ошибок не содержат ни паролей, ни ключей. =====
+function cryptoReady() { return !!(window.TetradCrypto && window.TetradCrypto.isConfigured()); }
+function cryptoErrorMessage(e) {
+  switch (e && e.code) {
+    case 'no_admin_key': return 'Шифрование ещё не настроено администратором сайта.';
+    case 'unavailable': return 'Шифрование недоступно в этом браузере (нужен HTTPS и современный браузер).';
+    case 'wrong_password': return 'Неверный пароль.';
+    case 'bad_format': return 'Данные зашифрованы в неподдерживаемом формате. Обновите страницу.';
+    case 'corrupt': return 'Не удалось расшифровать: данные повреждены или были изменены.';
+    default: return 'Ошибка шифрования.';
+  }
+}
+function encRpcErrorMessage(res, error) {
+  if (error) return error.message;
+  const st = res && res.status;
+  if (st === 'admin_key_not_registered') return 'ключ администратора не зарегистрирован на сервере (миграция 08)';
+  if (st === 'forbidden' || st === 'not_found') return 'нет прав на это действие или запись не найдена';
+  if (st === 'bad_format') return 'сервер отклонил формат данных';
+  if (st === 'weak') return 'пароль слишком короткий';
+  if (st === 'epoch_conflict') return 'ключ группы уже был обновлён — обновите страницу';
+  return 'неизвестная ошибка (' + (st || 'нет ответа') + ')';
+}
+// ===== Пароли групп: хранение и проверка — только на сервере (Edge Function group-password). =====
+// Браузер отправляет пароль по HTTPS функции, она шифрует его AES-256-GCM серверным ключом
+// (ключ лежит в секретах Supabase и в браузер не попадает). Обратно пароль получает только владелец.
+async function groupPasswordApi(body) {
+  try {
+    const { data, error } = await db.functions.invoke('group-password', { body });
+    if (!error) return data || { status: 'error' };
+    if (error.context && typeof error.context.json === 'function') {
+      try { return await error.context.json(); } catch (e) { /* тело не JSON */ }
+    }
+    return { status: 'network_error' };
+  } catch (e) {
+    return { status: 'network_error' };
+  }
+}
+function groupPasswordErrorMessage(r) {
+  switch (r && r.status) {
+    case 'rate_limited': return 'Слишком много попыток. Подождите немного и повторите.';
+    case 'weak_password': return 'Пароль должен содержать от 4 до 200 символов.';
+    case 'forbidden': return 'Нет прав на это действие.';
+    case 'unauthorized': return 'Сессия истекла. Войдите заново.';
+    case 'server_not_configured': return 'Сервер паролей групп ещё не настроен (нет серверного ключа).';
+    case 'admin_key_not_registered': return 'Ключ администратора не зарегистрирован на сервере (миграция 08).';
+    case 'rotation_required': return 'В группе включено шифрование: пароль меняется только вместе с ротацией ключа.';
+    case 'encrypted_group_requires_password': return 'Нельзя отключить пароль группы с шифрованием сообщений.';
+    case 'network_error': return 'Нет связи с сервером паролей групп (функция не развёрнута или нет сети).';
+    default: return 'Не удалось выполнить операцию (' + ((r && r.status) || 'нет ответа') + ').';
+  }
+}
+
+// ===== Шифрование сообщений групп =====
+async function fetchGroupKeyRows(groupId) {
+  const { data, error } = await db.from('group_keys').select('epoch, enc').eq('group_id', groupId).order('epoch', { ascending: true });
+  if (error) {
+    // таблицы ещё нет (миграция 08 не применена) → считаем, что шифрования нет
+    if (error.code === '42P01' || error.code === 'PGRST205') return { rows: [], missing: true };
+    return { rows: null, error };
+  }
+  return { rows: data || [] };
+}
+async function unlockGroupKeyring(groupId, password, rows) {
+  const ring = await TetradCrypto.unlockGroup({ groupId: String(groupId), password, rows });
+  groupKeyrings.set(String(groupId), ring);
+  return ring;
+}
+// Новая эпоха ключей группы: epoch = текущая + 1; prevKey — ключ текущей эпохи (цепочка назад)
+async function buildGroupEpoch(groupId, password, rows) {
+  const maxEpoch = rows.length ? Math.max(...rows.map(r => r.epoch)) : 0;
+  const ring = groupKeyrings.get(String(groupId));
+  let prevKey = null;
+  if (maxEpoch > 0) {
+    if (!ring || ring.latest !== maxEpoch) throw new TetradCrypto.CryptoFailure('wrong_password', 'Сначала откройте группу паролем');
+    prevKey = ring.keys.get(maxEpoch);
+  }
+  const made = await TetradCrypto.createGroupEpoch({ groupId: String(groupId), epoch: maxEpoch + 1, password, prevKey });
+  return { epoch: maxEpoch + 1, enc: made.enc };
+}
+
+// Запрос нового пароля с подтверждением. Возвращает пароль или null.
+async function askNewCryptoPassword(what) {
+  const p1 = await showPrompt('Придумайте пароль ' + what + ' (не короче ' + MIN_CRYPTO_PASSWORD + ' символов). Он нигде не сохраняется и его нельзя восстановить: если забудете — содержимое сможет прочитать только владелец сайта.', '', { eyebrow: 'шифрование', password: true, confirmLabel: 'Дальше' });
+  if (!p1) return null;
+  if (p1.length < MIN_CRYPTO_PASSWORD) { await showAlert('Пароль слишком короткий (минимум ' + MIN_CRYPTO_PASSWORD + ' символов).', 'ошибка'); return null; }
+  const p2 = await showPrompt('Повторите пароль:', '', { eyebrow: 'шифрование', password: true, confirmLabel: 'Готово' });
+  if (p2 === null) return null;
+  if (p1 !== p2) { await showAlert('Пароли не совпадают.', 'ошибка'); return null; }
+  return p1;
+}
+
 function copyTextToClipboard(text, onDone) {
   const fallbackCopy = () => {
     const tmp = document.createElement('textarea');
@@ -1103,6 +1194,10 @@ let currentProfile = null;
 let authEpoch = 0;
 let editorRenderedNoteId = null;   // какая заметка сейчас открыта в редакторе
 const savingNotes = new Map();     // id заметки -> Promise идущего сохранения
+// Ключи шифрования живут только в памяти вкладки и сбрасываются при выходе/смене аккаунта.
+const noteKeys = new Map();        // id заметки -> CryptoKey (DEK, неэкспортируемый)
+const groupKeyrings = new Map();   // id группы -> { latest, keys: Map(epoch -> CryptoKey) }
+const MIN_CRYPTO_PASSWORD = 8;
 let notes = [];
 let activeNoteId = null;
 let saveTimer = null;
@@ -1116,7 +1211,7 @@ let groupManageOpen = false;
 const unlockedGroupIds = new Set();
 // password_hash клиенту недоступен — читаем только публичные столбцы
 // lock_password клиенту недоступен — только флаг locked
-const NOTE_COLUMNS = 'id, user_id, title, content, tag, pinned, locked, updated_at';
+const NOTE_COLUMNS = 'id, user_id, title, content, tag, pinned, locked, updated_at, enc';
 const GROUP_COLUMNS = 'id, name, name_lower, owner_id, has_password';
 let noteSelectMode = false;
 let selectedNoteIds = new Set();
@@ -1478,6 +1573,8 @@ function clearSessionState() {
   noteSelectMode = false;
   selectedNoteIds.clear();
   savingNotes.clear();
+  noteKeys.clear();
+  groupKeyrings.clear();
   activeGroupName = null;
   activeGroupId = null;
   groupManageOpen = false;
@@ -1676,14 +1773,26 @@ async function loadNotes() {
   notes = data.map(row => {
     const prev = prevById.get(row.id);
     if (!prev) return row;
+    // у зашифрованной заметки в БД content пустой — расшифрованный текст в памяти не затираем
+    const keepPlain = (row.enc && noteKeys.has(row.id)) ? prev.content : undefined;
     if (row.id === dirtyId) {
       const { title, content, tag } = prev;
       Object.assign(prev, row, { title, content, tag });
     } else {
       Object.assign(prev, row);
     }
+    if (keepPlain !== undefined) prev.content = keepPlain;
     return prev;
   });
+  // обновляем расшифрованный текст открытых заметок (мог измениться на другом устройстве)
+  for (const n of notes) {
+    if (!n.enc || !noteKeys.has(n.id) || n.id === dirtyId) continue;
+    try {
+      n.content = await TetradCrypto.decryptNoteContent({ noteId: String(n.id), userId: String(n.user_id), dek: noteKeys.get(n.id), record: n.enc });
+      if (n.id === activeNoteId && noteSavedSnapshot && !noteHasUnsavedChanges) noteSavedSnapshot.content = n.content;
+    } catch (e) { /* оставляем прежний текст */ }
+  }
+  if (epoch !== authEpoch || !currentUser || currentUser.id !== uid) return false;
   if (!notes.some(n => n.id === activeNoteId)) {
     activeNoteId = notes.length > 0 ? notes[0].id : null;
   }
@@ -1921,7 +2030,7 @@ function renderEditor() {
     return;
   }
 
-  if (plan.perks.lockNote && note.locked && note.id !== unlockedNoteId) {
+  if ((note.enc || (plan.perks.lockNote && note.locked)) && note.id !== unlockedNoteId) {
     editorRenderedNoteId = null;
     noteHasUnsavedChanges = false;
     noteSavedSnapshot = null;
@@ -2001,13 +2110,21 @@ function renderEditor() {
     actions.appendChild(histBtn);
   }
 
-  if (plan.perks.lockNote) {
+  if (plan.perks.lockNote || note.enc) {
     const lockBtn = document.createElement('button');
     lockBtn.type = 'button';
     lockBtn.className = 'icon-btn neutral';
     lockBtn.textContent = note.locked ? 'снять пароль' : 'поставить пароль';
     lockBtn.onclick = () => toggleLock(note);
     actions.appendChild(lockBtn);
+    if (note.enc) {
+      const pwBtn = document.createElement('button');
+      pwBtn.type = 'button';
+      pwBtn.className = 'icon-btn neutral';
+      pwBtn.textContent = 'сменить пароль';
+      pwBtn.onclick = () => changeNotePassword(note);
+      actions.appendChild(pwBtn);
+    }
   }
 
   const saveBtn = document.createElement('button');
@@ -2116,8 +2233,36 @@ async function tryUnlockNote(id) {
   const note = notes.find(n => n.id === id);
   const input = document.getElementById('unlock-input');
   if (!note || !input) return;
-  // пароль заметки проверяется на сервере, клиент хеш не получает
-  const { data: ok, error } = await db.rpc('verify_note_lock', { p_note_id: String(id), p_password: input.value });
+  const password = input.value;
+  const epoch = authEpoch;
+  const showWrong = () => {
+    input.style.borderColor = 'var(--error)';
+    input.value = '';
+    input.placeholder = 'неверный пароль';
+  };
+
+  if (note.enc) {
+    // Зашифрованная заметка: пароль проверяется локально — верный пароль = успешная расшифровка (GCM).
+    input.disabled = true;
+    try {
+      const r = await TetradCrypto.unlockNote({ noteId: String(note.id), userId: String(note.user_id), password, record: note.enc });
+      if (epoch !== authEpoch) return;
+      noteKeys.set(note.id, r.dek);
+      note.content = r.plaintext;
+      unlockedNoteId = id;
+      renderEditor();
+    } catch (e) {
+      if (epoch !== authEpoch) return;
+      input.disabled = false;
+      if (e && e.code === 'wrong_password') showWrong();
+      else await showAlert(cryptoErrorMessage(e), 'не удалось расшифровать');
+    }
+    return;
+  }
+
+  // Старая заметка с серверной блокировкой (содержимое в базе открытым текстом)
+  const { data: ok, error } = await db.rpc('verify_note_lock', { p_note_id: String(id), p_password: password });
+  if (epoch !== authEpoch) return;
   if (error) {
     await showAlert('Не удалось проверить пароль: ' + error.message, 'ошибка');
     return;
@@ -2125,14 +2270,138 @@ async function tryUnlockNote(id) {
   if (ok === true) {
     unlockedNoteId = id;
     renderEditor();
+    if (cryptoReady()) {
+      const migrate = await showConfirm(
+        'Эта заметка защищена по-старому: её текст хранится в базе открытым. Перевести на шифрование тем же паролем? Прежний текст сохранится в закрытой резервной копии владельца сайта, пока он её не удалит.',
+        { eyebrow: 'шифрование', confirmLabel: 'Зашифровать', cancelLabel: 'Позже' }
+      );
+      if (migrate && epoch === authEpoch) await enableNoteEncryption(note, password);
+    }
   } else {
-    input.style.borderColor = 'var(--error)';
-    input.value = '';
-    input.placeholder = 'неверный пароль';
+    showWrong();
   }
 }
 
+// Включить шифрование заметки: шифруем локально, проверяем расшифровку «туда-обратно»,
+// пишем на сервер, затем читаем обратно и сверяем; при расхождении откатываем.
+async function enableNoteEncryption(note, password) {
+  if (noteHasUnsavedChanges && note.id === activeNoteId) {
+    if ((await saveNote(note)) !== true) return false;
+  }
+  const epoch = authEpoch;
+  const original = note.content || '';
+  const noteId = String(note.id), userId = String(note.user_id || currentUser.id);
+  let sealed;
+  try {
+    sealed = await TetradCrypto.encryptNewNote({ noteId, userId, password, plaintext: original });
+    const chk = await TetradCrypto.unlockNote({ noteId, userId, password, record: sealed.enc });
+    if (chk.plaintext !== original) throw new Error('mismatch');
+  } catch (e) {
+    if (epoch === authEpoch) await showAlert(cryptoErrorMessage(e), 'ошибка шифрования');
+    return false;
+  }
+  if (epoch !== authEpoch) return false;
+
+  const { data: res, error } = await db.rpc('enable_note_encryption', { p_note_id: noteId, p_enc: sealed.enc });
+  if (epoch !== authEpoch) return false;
+  if (error || !res || res.status !== 'ok') {
+    await showAlert('Не удалось включить шифрование: ' + encRpcErrorMessage(res, error), 'ошибка');
+    return false;
+  }
+
+  // сверка после записи
+  const { data: row, error: readErr } = await db.from('notes').select(NOTE_COLUMNS).eq('id', note.id).eq('user_id', currentUser.id).single();
+  if (epoch !== authEpoch) return false;
+  let verified = false;
+  if (!readErr && row && row.enc) {
+    try {
+      const chk = await TetradCrypto.unlockNote({ noteId, userId, password, record: row.enc });
+      verified = chk.plaintext === original;
+    } catch (e) { verified = false; }
+  }
+  if (!verified) {
+    // возврат к открытому виду; резервная копия прежнего текста остаётся на сервере
+    await db.rpc('disable_note_encryption', { p_note_id: noteId, p_content: original });
+    if (epoch === authEpoch) {
+      await loadNotes();
+      renderSidebar(); renderEditor();
+      await showAlert('Проверка после записи не прошла, шифрование не включено. Текст заметки не изменён.', 'ошибка');
+    }
+    return false;
+  }
+
+  Object.assign(note, row, { content: original });
+  noteKeys.set(note.id, sealed.dek);
+  unlockedNoteId = note.id;
+  noteHasUnsavedChanges = false;
+  noteSavedSnapshot = { title: note.title || '', content: original, tag: note.tag || '' };
+  logEvent('user_action', 'Включено шифрование заметки', { note_id: note.id });
+  renderSidebar();
+  renderEditor();
+  return true;
+}
+
+async function disableNoteEncryption(note) {
+  const ok = await showConfirm(
+    'Снять шифрование? Текст заметки будет храниться в базе открытым, а зашифрованная история версий будет удалена.',
+    { eyebrow: 'снять пароль', confirmLabel: 'Снять', danger: true }
+  );
+  if (!ok) return;
+  if (noteHasUnsavedChanges && (await saveNote(note)) !== true) return;
+  const epoch = authEpoch;
+  const { data: res, error } = await db.rpc('disable_note_encryption', { p_note_id: String(note.id), p_content: note.content || '' });
+  if (epoch !== authEpoch) return;
+  if (error || !res || res.status !== 'ok') {
+    await showAlert('Не удалось снять шифрование: ' + encRpcErrorMessage(res, error), 'ошибка');
+    return;
+  }
+  note.enc = null;
+  note.locked = false;
+  note.updated_at = res.updated_at || note.updated_at;
+  noteKeys.delete(note.id);
+  logEvent('user_action', 'Снято шифрование заметки', { note_id: note.id });
+  renderSidebar();
+  renderEditor();
+}
+
+async function changeNotePassword(note) {
+  if (!note.enc) return;
+  const oldPassword = await showPrompt('Текущий пароль заметки:', '', { eyebrow: 'смена пароля', password: true, confirmLabel: 'Дальше' });
+  if (!oldPassword) return;
+  const newPassword = await askNewCryptoPassword('заметки');
+  if (!newPassword) return;
+  const epoch = authEpoch;
+  let wrap;
+  try {
+    wrap = await TetradCrypto.rewrapNotePassword({ noteId: String(note.id), userId: String(note.user_id), record: note.enc, oldPassword, newPassword });
+  } catch (e) {
+    if (epoch === authEpoch) await showAlert(cryptoErrorMessage(e), 'смена пароля не выполнена');
+    return;
+  }
+  if (epoch !== authEpoch) return;
+  const { data: res, error } = await db.rpc('rewrap_note_password', { p_note_id: String(note.id), p_kdf: wrap.kdf, p_dek_user: wrap.dek_user });
+  if (epoch !== authEpoch) return;
+  if (error || !res || res.status !== 'ok') {
+    await showAlert('Не удалось сменить пароль: ' + encRpcErrorMessage(res, error), 'ошибка');
+    return;
+  }
+  note.enc = { ...note.enc, kdf: wrap.kdf, dek_user: wrap.dek_user };
+  note.updated_at = res.updated_at || note.updated_at;
+  await showAlert('Пароль заметки изменён. Содержимое перешифровывать не потребовалось: изменился только ключ, защищающий ключ заметки.', 'готово');
+}
+
 async function toggleLock(note) {
+  if (note.enc) { await disableNoteEncryption(note); return; }
+
+  // Шифрование настроено — новые пароли на заметки только зашифрованные
+  if (!note.locked && cryptoReady()) {
+    const password = await askNewCryptoPassword('заметки');
+    if (!password) return;
+    await enableNoteEncryption(note, password);
+    return;
+  }
+
+  // Прежний механизм (шифрование не настроено или снимается старая серверная блокировка)
   let newPassword = null;
   if (!note.locked) {
     const pass = await showPrompt('Придумайте пароль для этой заметки:', '', { eyebrow: 'защита паролем', password: true, confirmLabel: 'Поставить' });
@@ -2170,7 +2439,7 @@ async function exportNote(note) {
 }
 
 async function showHistory(note) {
-  const { data: history, error } = await db
+  let { data: history, error } = await db
     .from('note_history')
     .select('*')
     .eq('note_id', note.id)
@@ -2186,6 +2455,17 @@ async function showHistory(note) {
     return;
   }
 
+  if (note.enc) {
+    const dek = noteKeys.get(note.id);
+    if (!dek) { await showAlert('Заметка заблокирована: введите пароль.', 'история версий'); return; }
+    history = await Promise.all(history.map(async h => {
+      if (!h.enc) return { ...h, content: h.content || '' };
+      try {
+        return { ...h, content: await TetradCrypto.decryptHistory({ noteId: String(note.id), userId: String(note.user_id), dek, record: h.enc }) };
+      } catch (e) { return { ...h, content: '(не удалось расшифровать)', __bad: true }; }
+    }));
+  }
+
   const idx = await showHistoryPicker(history);
   if (idx === null) return;
   if (idx >= 0 && idx < history.length) {
@@ -2193,6 +2473,17 @@ async function showHistory(note) {
     if (!(await confirmDiscardIfDirty())) return;
     const epoch = authEpoch;
     const restored = history[idx].content;
+    if (note.enc) {
+      if (history[idx].__bad) { await showAlert('Эту версию не удалось расшифровать.', 'ошибка'); return; }
+      const prevContent = note.content;
+      note.content = restored;
+      noteHasUnsavedChanges = true;
+      if ((await saveNote(note)) !== true) { note.content = prevContent; noteHasUnsavedChanges = false; return; }
+      if (epoch !== authEpoch) return;
+      renderSidebar();
+      renderEditor();
+      return;
+    }
     const { data: upd, error: restoreError } = await db.from('notes')
       .update({ content: restored, updated_at: new Date().toISOString() })
       .eq('id', note.id).eq('user_id', currentUser.id)
@@ -2267,10 +2558,17 @@ async function createNote() {
   }
 }
 
+// Забываем ключ и расшифрованный текст заметки, когда пользователь от неё уходит
+function relockNote(id) {
+  const n = notes.find(x => x.id === id);
+  if (n && n.enc) { n.content = ''; noteKeys.delete(n.id); }
+}
+
 async function selectNote(id) {
   if (id === activeNoteId) { collapseMobileSidebar(); return; }
   const ok = await confirmDiscardIfDirty();
   if (!ok) return;
+  relockNote(activeNoteId);
   activeNoteId = id;
   unlockedNoteId = null;
   renderSidebar();
@@ -2415,6 +2713,19 @@ function saveNote(note) {
   return promise;
 }
 
+// История версий: для зашифрованных заметок версия шифруется ключом заметки (content остаётся пустым)
+async function insertNoteHistory(note, plaintext) {
+  if (note.enc) {
+    const dek = noteKeys.get(note.id);
+    if (!dek) return { error: { message: 'заметка заблокирована' } };
+    try {
+      const h = await TetradCrypto.encryptHistory({ noteId: String(note.id), userId: String(note.user_id), dek, plaintext });
+      return await db.from('note_history').insert({ note_id: note.id, content: '', enc: h });
+    } catch (e) { return { error: { message: cryptoErrorMessage(e) } }; }
+  }
+  return await db.from('note_history').insert({ note_id: note.id, content: plaintext });
+}
+
 async function doSaveNote(note) {
   if (!currentUser) return false;
   const epoch = authEpoch;
@@ -2454,31 +2765,62 @@ async function doSaveNote(note) {
     return q.select('updated_at');
   };
 
-  let res = await doUpdate(true);
-  if (epoch !== authEpoch) return false;
+  if (note.enc) {
+    // Зашифрованная заметка: содержимое шифруется в браузере, на сервер уходит только шифртекст.
+    const dek = noteKeys.get(note.id);
+    if (!dek) return fail('Заметка заблокирована: введите пароль, чтобы сохранить изменения.');
+    let sealedContent;
+    try {
+      sealedContent = await TetradCrypto.encryptNoteContent({ noteId: String(note.id), userId: String(note.user_id || uid), dek, plaintext: sent.content });
+    } catch (e) { return fail(cryptoErrorMessage(e)); }
+    const callSave = (expected) => db.rpc('save_encrypted_note', {
+      p_note_id: String(note.id), p_title: sent.title, p_tag: sent.tag,
+      p_nonce: sealedContent.nonce, p_ct: sealedContent.ct, p_expected: expected || null
+    });
+    let r = await callSave(expectedUpdatedAt);
+    if (epoch !== authEpoch) return false;
+    if (!r.error && r.data && r.data.status === 'conflict') {
+      const overwrite = await showConfirm(
+        'Эта заметка была изменена в другом окне или на другом устройстве. Перезаписать ту версию текстом, который открыт здесь?',
+        { eyebrow: 'конфликт версий', confirmLabel: 'Перезаписать', danger: true }
+      );
+      if (epoch !== authEpoch) return false;
+      if (!overwrite) return fail('Сохранение отменено: на сервере более новая версия заметки.');
+      r = await callSave(null);
+      if (epoch !== authEpoch) return false;
+    }
+    if (r.error || !r.data || r.data.status !== 'ok') {
+      return fail('Не удалось сохранить заметку: ' + encRpcErrorMessage(r.data, r.error));
+    }
+    note.updated_at = r.data.updated_at || nowIso;
+    note.enc = { ...note.enc, nonce: sealedContent.nonce, ct: sealedContent.ct };
+  } else {
+    let res = await doUpdate(true);
+    if (epoch !== authEpoch) return false;
 
-  if (!res.error && (!res.data || res.data.length === 0)) {
-    const cur = await db.from('notes').select('id').eq('id', note.id).eq('user_id', uid).maybeSingle();
-    if (epoch !== authEpoch) return false;
-    if (cur.error) return fail('Не удалось сохранить заметку: ' + cur.error.message);
-    if (!cur.data) return fail('Не удалось сохранить: заметка была удалена в другом окне или на другом устройстве.');
-    const overwrite = await showConfirm(
-      'Эта заметка была изменена в другом окне или на другом устройстве. Перезаписать ту версию текстом, который открыт здесь?',
-      { eyebrow: 'конфликт версий', confirmLabel: 'Перезаписать', danger: true }
-    );
-    if (epoch !== authEpoch) return false;
-    if (!overwrite) return fail('Сохранение отменено: на сервере более новая версия заметки.');
-    res = await doUpdate(false);
-    if (epoch !== authEpoch) return false;
+    if (!res.error && (!res.data || res.data.length === 0)) {
+      const cur = await db.from('notes').select('id').eq('id', note.id).eq('user_id', uid).maybeSingle();
+      if (epoch !== authEpoch) return false;
+      if (cur.error) return fail('Не удалось сохранить заметку: ' + cur.error.message);
+      if (!cur.data) return fail('Не удалось сохранить: заметка была удалена в другом окне или на другом устройстве.');
+      const overwrite = await showConfirm(
+        'Эта заметка была изменена в другом окне или на другом устройстве. Перезаписать ту версию текстом, который открыт здесь?',
+        { eyebrow: 'конфликт версий', confirmLabel: 'Перезаписать', danger: true }
+      );
+      if (epoch !== authEpoch) return false;
+      if (!overwrite) return fail('Сохранение отменено: на сервере более новая версия заметки.');
+      res = await doUpdate(false);
+      if (epoch !== authEpoch) return false;
+    }
+
+    if (res.error) return fail('Не удалось сохранить заметку: ' + res.error.message);
+    if (!res.data || res.data.length === 0) return fail('Не удалось сохранить заметку: запись не найдена или нет прав.');
+
+    note.updated_at = res.data[0].updated_at || nowIso;
   }
 
-  if (res.error) return fail('Не удалось сохранить заметку: ' + res.error.message);
-  if (!res.data || res.data.length === 0) return fail('Не удалось сохранить заметку: запись не найдена или нет прав.');
-
-  note.updated_at = res.data[0].updated_at || nowIso;
-
   if (contentChanged && getCurrentPlan().perks.history) {
-    const { error: histError } = await db.from('note_history').insert({ note_id: note.id, content: sent.content });
+    const { error: histError } = await insertNoteHistory(note, sent.content);
     if (epoch !== authEpoch) return true;
     if (histError) {
       console.warn('note_history insert failed:', histError);
@@ -3588,6 +3930,10 @@ async function renderGroupsPanel() {
           <label>Пароль группы</label>
           <input type="password" id="new-group-password" placeholder="придумайте пароль">
         </div>
+        ${cryptoReady() ? `<div class="group-form-checkbox" id="new-group-encrypt-row" onclick="event.target.tagName!=='INPUT' && document.getElementById('new-group-encrypt').click()">
+          <input type="checkbox" id="new-group-encrypt" checked>
+          <label for="new-group-encrypt">Шифровать сообщения (нужен пароль)</label>
+        </div>` : ''}
         <button type="button" class="group-form-btn" onclick="createGroup()">Создать группу</button>
       `}
     </div>
@@ -3690,12 +4036,10 @@ async function createGroup() {
   if (name.length < 2) { showGroupFormError('create-group-error', 'Название группы должно содержать не менее 2 символов.'); return; }
   if (wantsPassword && (!password || password.length < 4)) { showGroupFormError('create-group-error', 'Пароль группы должен содержать не менее 4 символов.'); return; }
 
-  // пароль хешируется на сервере (bcrypt через pgcrypto)
   const epoch = authEpoch;
-  const { data, error } = await db.rpc('create_group', {
-    p_name: name,
-    p_password: wantsPassword ? password : null,
-  });
+  // Группа создаётся БЕЗ пароля; пароль затем шифрует и сохраняет Edge Function (bcrypt не используется).
+  let { data, error } = await db.rpc('create_group_no_password', { p_name: name });
+  if (isMissingRpc(error)) ({ data, error } = await db.rpc('create_group', { p_name: name, p_password: null }));
   if (epoch !== authEpoch) return;
 
   if (error) {
@@ -3709,7 +4053,34 @@ async function createGroup() {
     await renderGroupsPanel();
     return;
   }
-  logEvent('user_action', 'Создана группа', { group_id: data.id, name });
+
+  if (wantsPassword) {
+    const encryptEl = document.getElementById('new-group-encrypt');
+    const withE2E = !!(encryptEl && encryptEl.checked && cryptoReady());
+    let body = { action: 'set', group_id: String(data.id), password };
+    let ring = null;
+    try {
+      if (withE2E) {
+        const made = await TetradCrypto.createGroupEpoch({ groupId: String(data.id), epoch: 1, password, prevKey: null });
+        body = { ...body, epoch: 1, enc: made.enc };
+        ring = { latest: 1, keys: new Map([[1, made.key]]) };
+      }
+    } catch (e) {
+      showGroupFormError('create-group-error', cryptoErrorMessage(e));
+    }
+    const r = ring || !withE2E ? await groupPasswordApi(body) : { status: 'error' };
+    if (epoch !== authEpoch) return;
+    if (r.status !== 'ok') {
+      // откат: группа без пароля была бы открыта всем, кто знает название
+      await db.rpc('delete_group', { p_group_id: String(data.id) });
+      if (epoch !== authEpoch) return;
+      showGroupFormError('create-group-error', 'Группа не создана: ' + groupPasswordErrorMessage(r));
+      await renderGroupsPanel();
+      return;
+    }
+    if (ring) groupKeyrings.set(String(data.id), ring);
+  }
+  logEvent('user_action', 'Создана группа', { group_id: data.id });
 
   groupManageOpen = false;
   activeGroupName = data.name_lower;
@@ -3726,23 +4097,12 @@ async function joinGroup() {
 
   if (!name) { showGroupFormError('join-group-error', 'Введите название группы.'); return; }
 
-  // проверка пароля выполняется на сервере
+  // пароль проверяет Edge Function: расшифровывает сохранённое значение и сравнивает за постоянное время
   const epoch = authEpoch;
-  // join_group_and_record проверяет пароль и записывает членство на сервере одной операцией.
-  // Если миграция не применена — прежний путь (join_group + запись из клиента).
-  let legacy = false;
-  let { data: res, error } = await db.rpc('join_group_and_record', { p_name: name, p_password: password || null });
-  if (isMissingRpc(error)) {
-    legacy = true;
-    ({ data: res, error } = await db.rpc('join_group', { p_name: name, p_password: password || null }));
-  }
+  const res = await groupPasswordApi({ action: 'join', name, password: password || '' });
   if (epoch !== authEpoch) return;
 
-  if (error) {
-    showGroupFormError('join-group-error', 'Не удалось войти в группу: ' + error.message);
-    return;
-  }
-  if (!res || res.status === 'not_found') {
+  if (res.status === 'not_found') {
     showGroupFormError('join-group-error', 'Группа с таким названием не найдена.');
     return;
   }
@@ -3750,14 +4110,20 @@ async function joinGroup() {
     showGroupFormError('join-group-error', 'Неверный пароль группы.');
     return;
   }
+  if (res.status !== 'ok') {
+    showGroupFormError('join-group-error', 'Не удалось войти в группу: ' + groupPasswordErrorMessage(res));
+    return;
+  }
 
   const g = { id: res.group_id, name_lower: res.name_lower };
 
-  if (legacy) {
-    const { error: recentErr } = await db.from('recent_groups').upsert({ user_id: currentUser.id, group_id: g.id, last_visited: new Date().toISOString() });
-    if (recentErr) {
-      showGroupFormError('join-group-error', 'Не удалось добавить группу в список: ' + recentErr.message);
-      return;
+  // если сообщения группы зашифрованы — открываем ключи тем же паролем
+  if (password) {
+    const kr = await fetchGroupKeyRows(g.id);
+    if (epoch !== authEpoch) return;
+    if (kr.rows && kr.rows.length) {
+      try { await unlockGroupKeyring(g.id, password, kr.rows); }
+      catch (e) { await showAlert(cryptoErrorMessage(e) + ' Откройте группу ещё раз и введите пароль.', 'шифрование группы'); }
     }
   }
 
@@ -3861,12 +4227,14 @@ async function buildGroupManagePanel(g, posts) {
     changeBtn.onclick = () => changeGroupPasswordPrompt(g);
     passActions.appendChild(changeBtn);
 
-    const offBtn = document.createElement('button');
-    offBtn.type = 'button';
-    offBtn.className = 'group-manage-mini-btn danger';
-    offBtn.textContent = 'отключить';
-    offBtn.onclick = () => setGroupPassword(g, null);
-    passActions.appendChild(offBtn);
+    if (!(groupKeyrings.has(String(g.id)) || g.__encrypted)) {
+      const offBtn = document.createElement('button');
+      offBtn.type = 'button';
+      offBtn.className = 'group-manage-mini-btn danger';
+      offBtn.textContent = 'отключить';
+      offBtn.onclick = () => setGroupPassword(g, null);
+      passActions.appendChild(offBtn);
+    }
   } else {
     const onBtn = document.createElement('button');
     onBtn.type = 'button';
@@ -3875,8 +4243,36 @@ async function buildGroupManagePanel(g, posts) {
     onBtn.onclick = () => changeGroupPasswordPrompt(g);
     passActions.appendChild(onBtn);
   }
+  if (isProtected) {
+    const showBtn = document.createElement('button');
+    showBtn.type = 'button';
+    showBtn.className = 'group-manage-mini-btn';
+    showBtn.textContent = 'показать';
+    showBtn.onclick = () => revealGroupPassword(g);
+    passActions.appendChild(showBtn);
+  }
   passRow.appendChild(passActions);
   panel.appendChild(passRow);
+
+  if (cryptoReady()) {
+    const encRow = document.createElement('div');
+    encRow.className = 'group-manage-row';
+    const isEnc = groupKeyrings.has(String(g.id)) || !!g.__encrypted;
+    encRow.innerHTML = `
+      <span class="group-manage-label">шифрование</span>
+      <span class="group-manage-value">${isEnc ? 'включено' : 'выключено'}</span>
+    `;
+    const encActions = document.createElement('div');
+    encActions.className = 'group-manage-actions';
+    const encBtn = document.createElement('button');
+    encBtn.type = 'button';
+    encBtn.className = 'group-manage-mini-btn';
+    encBtn.textContent = isEnc ? 'ротация ключа' : 'включить';
+    encBtn.onclick = () => (isEnc ? rotateGroupKey(g) : enableGroupEncryption(g));
+    encActions.appendChild(encBtn);
+    encRow.appendChild(encActions);
+    panel.appendChild(encRow);
+  }
 
 
 
@@ -3959,13 +4355,94 @@ async function changeGroupPasswordPrompt(g) {
 }
 
 async function setGroupPassword(g, plainPassword) {
-  const { data: res, error } = await db.rpc('set_group_password', {
-    p_group_id: String(g.id),
-    p_password: plainPassword || null,
-  });
-  if (error || !res || res.status !== 'ok') {
-    const reason = error ? error.message : (res && res.status === 'forbidden' ? 'нет прав на это действие' : 'недопустимый пароль');
-    await showAlert('Не удалось обновить пароль: ' + reason, 'ошибка');
+  const epoch = authEpoch;
+  const kr = await fetchGroupKeyRows(g.id);
+  if (epoch !== authEpoch) return;
+  if (kr.error) { await showAlert('Не удалось проверить состояние группы: ' + kr.error.message, 'ошибка'); return; }
+
+  // группа с шифрованием: пароль меняется только вместе с ротацией ключа
+  if (kr.rows.length) {
+    if (!plainPassword) { await showAlert('Нельзя отключить пароль группы, сообщения которой зашифрованы.', 'ошибка'); return; }
+    return rotateGroupKeyWithPassword(g, plainPassword, kr.rows);
+  }
+
+  const r = await groupPasswordApi({ action: 'set', group_id: String(g.id), password: plainPassword || null });
+  if (epoch !== authEpoch) return;
+  if (r.status !== 'ok') {
+    await showAlert('Не удалось обновить пароль: ' + groupPasswordErrorMessage(r), 'ошибка');
+    return;
+  }
+  await renderGroupsPanel();
+  await renderGroupArea();
+}
+
+// Владелец может посмотреть пароль своей группы (участники — нет; сервер проверяет права на каждый запрос)
+async function revealGroupPassword(g) {
+  const r = await groupPasswordApi({ action: 'reveal', group_id: String(g.id) });
+  if (r.status === 'ok') {
+    await showAlert('Пароль группы «' + g.name + '»:\n\n' + r.password + '\n\nНе передавайте его в открытых каналах.', 'пароль группы');
+  } else if (r.status === 'legacy_unrecoverable') {
+    await showAlert('Эта группа создана до перехода на шифрование паролей: старый пароль хранится в необратимом виде и не может быть показан. Нажмите «сменить» и задайте пароль заново — участникам нужно будет сообщить новый.', 'пароль в старом формате');
+  } else if (r.status === 'no_password') {
+    await showAlert('У группы нет пароля.', 'пароль группы');
+  } else {
+    await showAlert(groupPasswordErrorMessage(r), 'ошибка');
+  }
+}
+
+async function rotateGroupKeyWithPassword(g, newPassword, rows) {
+  const epoch = authEpoch;
+  try {
+    // для цепочки нужен ключ текущей эпохи: если группа не открыта в этой сессии — просим текущий пароль
+    const maxEpoch = Math.max(...rows.map(r => r.epoch));
+    let ring = groupKeyrings.get(String(g.id));
+    if (!ring || ring.latest !== maxEpoch) {
+      const cur = await showPrompt('Текущий пароль группы (нужен, чтобы сохранить доступ к прежним сообщениям):', '', { eyebrow: 'ротация ключа', password: true, confirmLabel: 'Дальше' });
+      if (!cur) return;
+      ring = await unlockGroupKeyring(g.id, cur, rows);
+    }
+    const built = await buildGroupEpoch(g.id, newPassword, rows);
+    const r = await groupPasswordApi({ action: 'set', group_id: String(g.id), password: newPassword, epoch: built.epoch, enc: built.enc });
+    if (epoch !== authEpoch) return;
+    if (r.status !== 'ok') { await showAlert('Не удалось сменить ключ группы: ' + groupPasswordErrorMessage(r), 'ошибка'); return; }
+    const fresh = await fetchGroupKeyRows(g.id);
+    if (fresh.rows && fresh.rows.length) await unlockGroupKeyring(g.id, newPassword, fresh.rows);
+  } catch (e) {
+    if (epoch === authEpoch) await showAlert(cryptoErrorMessage(e), 'ошибка шифрования');
+    return;
+  }
+  if (epoch !== authEpoch) return;
+  await showAlert('Ключ группы обновлён. Сообщите участникам новый пароль: по старому они больше не смогут ни читать новые сообщения, ни писать.', 'готово');
+  await renderGroupsPanel();
+  await renderGroupArea();
+}
+
+async function rotateGroupKey(g) {
+  const pw = await askNewCryptoPassword('группы');
+  if (!pw) return;
+  const kr = await fetchGroupKeyRows(g.id);
+  if (!kr.rows || !kr.rows.length) { await showAlert('В группе не включено шифрование.', 'ошибка'); return; }
+  await rotateGroupKeyWithPassword(g, pw, kr.rows);
+}
+
+async function enableGroupEncryption(g) {
+  if (!cryptoReady()) { await showAlert('Шифрование ещё не настроено администратором сайта.', 'ошибка'); return; }
+  const ok = await showConfirm(
+    'Новые сообщения группы будут шифроваться. Для этого нужно задать новый пароль группы и сообщить его участникам. Прежние сообщения останутся в открытом виде.',
+    { eyebrow: 'шифрование группы', confirmLabel: 'Продолжить' }
+  );
+  if (!ok) return;
+  const pw = await askNewCryptoPassword('группы');
+  if (!pw) return;
+  const epoch = authEpoch;
+  try {
+    const made = await TetradCrypto.createGroupEpoch({ groupId: String(g.id), epoch: 1, password: pw, prevKey: null });
+    const r = await groupPasswordApi({ action: 'set', group_id: String(g.id), password: pw, epoch: 1, enc: made.enc });
+    if (epoch !== authEpoch) return;
+    if (r.status !== 'ok') { await showAlert('Не удалось включить шифрование: ' + groupPasswordErrorMessage(r), 'ошибка'); return; }
+    groupKeyrings.set(String(g.id), { latest: 1, keys: new Map([[1, made.key]]) });
+  } catch (e) {
+    if (epoch === authEpoch) await showAlert(cryptoErrorMessage(e), 'ошибка шифрования');
     return;
   }
   await renderGroupsPanel();
@@ -3988,6 +4465,14 @@ async function removeGroupMember(g, authorId, authorName) {
     if (!res || res.status !== 'ok') {
       await showAlert('Не удалось удалить участника: нет прав на это действие.', 'ошибка');
       return;
+    }
+    const kr = await fetchGroupKeyRows(g.id);
+    if (epoch === authEpoch && kr.rows && kr.rows.length) {
+      const rotate = await showConfirm(
+        'Участник удалён. Чтобы он не мог читать новые сообщения, смените ключ группы (потребуется новый пароль).',
+        { eyebrow: 'ротация ключа', confirmLabel: 'Сменить ключ', cancelLabel: 'Позже' }
+      );
+      if (rotate && epoch === authEpoch) { await rotateGroupKey(g); return; }
     }
     await renderGroupArea();
     return;
@@ -4023,10 +4508,11 @@ async function renderGroupArea() {
 
   const epoch = authEpoch;
   const requestedGroupId = activeGroupId;
-  const [groupResult, postsResult, myCount] = await Promise.all([
+  const [groupResult, postsResult, myCount, keysResult] = await Promise.all([
     db.from('groups').select(GROUP_COLUMNS).eq('id', requestedGroupId).single(),
     db.from('group_posts').select('*').eq('group_id', requestedGroupId).order('created_at', { ascending: true }),
     getMyMessageCountInGroup(requestedGroupId),
+    fetchGroupKeyRows(requestedGroupId),
   ]);
   // аккаунт или открытая группа сменились, пока шёл запрос — ответ устарел
   if (epoch !== authEpoch || requestedGroupId !== activeGroupId) return;
@@ -4047,6 +4533,11 @@ async function renderGroupArea() {
 
   const isOwner = g.owner_id === currentUser.id;
   const posts = postsResult.data;
+  const keyRows = keysResult.rows || [];
+  g.__encrypted = keyRows.length > 0;
+  const ringNow = groupKeyrings.get(String(g.id));
+  const topEpoch = keyRows.length ? Math.max(...keyRows.map(r => r.epoch)) : 0;
+  const groupLocked = g.__encrypted && !(ringNow && ringNow.latest === topEpoch);
   const myLimit = getMessageLimit();
   const limitReached = myCount >= myLimit;
 
@@ -4079,6 +4570,50 @@ async function renderGroupArea() {
     area.appendChild(manage);
   }
 
+  if (groupLocked) {
+    // сообщения зашифрованы, ключ группы в этой сессии ещё не открыт (или пароль группы сменили)
+    const lockBox = document.createElement('div');
+    lockBox.className = 'editor-empty';
+    lockBox.innerHTML = `
+      <div class="editor-empty-title">🔒 Сообщения группы зашифрованы</div>
+      <div>Введите пароль группы, чтобы читать и писать сообщения.</div>
+      <input type="password" id="group-unlock-input" class="unlock-input" autocomplete="off">
+      <button type="button" id="group-unlock-btn">Открыть</button>`;
+    area.appendChild(lockBox);
+    const input = lockBox.querySelector('#group-unlock-input');
+    const go = async () => {
+      const pw = input.value;
+      if (!pw) return;
+      input.disabled = true;
+      try {
+        await unlockGroupKeyring(g.id, pw, keyRows);
+        if (epoch !== authEpoch || requestedGroupId !== activeGroupId) return;
+        await renderGroupArea();
+      } catch (e) {
+        if (epoch !== authEpoch) return;
+        input.disabled = false;
+        input.value = '';
+        input.style.borderColor = 'var(--error)';
+        input.placeholder = e && e.code === 'wrong_password' ? 'неверный пароль' : cryptoErrorMessage(e);
+      }
+    };
+    lockBox.querySelector('#group-unlock-btn').onclick = go;
+    input.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') go(); });
+    return;
+  }
+
+  // расшифровка сообщений; зашифрованные, но нечитаемые, показываем заглушкой
+  const ring = groupKeyrings.get(String(g.id));
+  for (const p of (posts || [])) {
+    if (!p.enc) { p.__text = p.text; continue; }
+    try {
+      p.__text = await TetradCrypto.decryptGroupPost({ groupId: String(g.id), authorId: String(p.author_id), keyring: ring, record: p.enc });
+    } catch (e) {
+      p.__text = '🔒 не удалось расшифровать это сообщение';
+      p.__failed = true;
+    }
+  }
+
   const feed = document.createElement('div');
   feed.className = 'group-feed';
 
@@ -4104,10 +4639,11 @@ async function renderGroupArea() {
         </div>
         <div class="group-post-text"></div>
       `;
-      postEl.querySelector('.group-post-text').textContent = p.text;
+      postEl.querySelector('.group-post-text').textContent = p.__text;
       const copyPostBtn = postEl.querySelector('.group-post-copy-btn');
       copyPostBtn.onclick = () => {
-        copyTextToClipboard(p.text, (ok) => {
+        if (p.__failed) return;
+        copyTextToClipboard(p.__text, (ok) => {
           copyPostBtn.textContent = ok ? 'скопировано ✓' : 'не удалось скопировать';
           setTimeout(() => { copyPostBtn.textContent = 'скопировать'; }, ok ? 1200 : 2000);
         });
@@ -4177,15 +4713,23 @@ async function sendGroupPost(groupId, textarea) {
     if (epoch !== authEpoch) return;
     if (count >= getMessageLimit()) { await renderGroupArea(); return; }
 
-    const { error } = await db.from('group_posts').insert({
-      group_id: groupId,
-      author_id: currentUser.id,
-      author_name: currentProfile.display_name,
-      text
-    });
+    const ring = groupKeyrings.get(String(groupId));
+    const row = { group_id: groupId, author_id: currentUser.id, author_name: currentProfile.display_name, text };
+    if (ring) {
+      // сообщения зашифрованной группы шифруются в браузере ключом текущей эпохи
+      try {
+        row.enc = await TetradCrypto.encryptGroupPost({ groupId: String(groupId), epoch: ring.latest, authorId: String(currentUser.id), key: ring.keys.get(ring.latest), plaintext: text });
+        row.text = '[зашифровано]';
+      } catch (e) { await showAlert(cryptoErrorMessage(e), 'ошибка шифрования'); return; }
+    }
+    const { error } = await db.from('group_posts').insert(row);
     if (epoch !== authEpoch) return;
 
-    if (error) { await showAlert('Не удалось отправить сообщение: ' + error.message, 'ошибка'); return; }
+    if (error) {
+      await showAlert('Не удалось отправить сообщение: ' + error.message, 'ошибка');
+      if (ring) await renderGroupArea();   // ключ группы мог смениться — покажет форму ввода пароля
+      return;
+    }
 
     textarea.value = '';
     await renderGroupArea();
