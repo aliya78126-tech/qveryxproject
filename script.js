@@ -199,7 +199,7 @@ function encRpcErrorMessage(res, error) {
 // (ключ лежит в секретах Supabase и в браузер не попадает). Обратно пароль получает только владелец.
 async function groupPasswordApi(body) {
   try {
-    const { data, error } = await db.functions.invoke('group-password', { body });
+    const { data, error } = await db.functions.invoke('smooth-task', { body });
     if (!error) return data || { status: 'error' };
     if (error.context && typeof error.context.json === 'function') {
       try { return await error.context.json(); } catch (e) { /* тело не JSON */ }
