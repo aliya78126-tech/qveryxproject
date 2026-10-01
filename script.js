@@ -4842,3 +4842,11 @@ function setupSidebarResize() {
     showError('Не удалось восстановить сессию: ' + translateAuthError(err && err.message ? err.message : 'ошибка сети') + ' Войдите заново.');
   }
 })();
+const { data, error } = await supabase.functions.invoke(
+  "group-password",
+  {
+    body: { action: "test_invalid" }
+  }
+);
+
+console.log(data, error);
