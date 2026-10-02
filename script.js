@@ -205,15 +205,37 @@ const GROUP_PASSWORD_FUNCTION = 'smooth-task';
 // 'forbidden', 'wrong_password' и т.д.) плюс http. Иначе status описывает, на каком уровне случился сбой:
 //   'network_error'      — запрос не дошёл до Supabase (нет сети, блокировка, сбой CORS-preflight) [FunctionsFetchError]
 //   'function_not_found' — Supabase ответил, что такой функции нет (HTTP 404 / relay-ошибка)
-//   'unauthorized'       — шлюз отклонил JWT (HTTP 401)
+//   'jwt_rejected'       — шлюз Supabase отклонил JWT (HTTP 401), код функции не выполнялся
+//   'unauthorized'       — нет сессии или функция не приняла токен (её собственный ответ 401)
 //   'relay_error'        — сбой на стороне Supabase между шлюзом и функцией [FunctionsRelayError]
 //   'function_error'     — функция упала и вернула не JSON (HTTP 5xx и т.п.)
 // Пароль, JWT и тело запроса не логируются.
 async function groupPasswordApi(body) {
+  let r = await groupPasswordCall(body);
+  // 401 приходит и от шлюза (просрочен/отклонён JWT), и от самой функции (токен не проверился).
+  // Запрос отклонён до выполнения действия, поэтому один раз обновляем сессию и повторяем.
+  if (r.status === 'unauthorized' || r.status === 'jwt_rejected') {
+    try {
+      const { data, error } = await db.auth.refreshSession();
+      if (!error && data && data.session) r = await groupPasswordCall(body);
+    } catch (e) { /* остаётся исходная ошибка авторизации */ }
+  }
+  return r;
+}
+
+async function groupPasswordCall(body) {
   const fn = GROUP_PASSWORD_FUNCTION;
+  // Токен берём явно: без сессии supabase-js подставил бы anon-ключ, и функция ответила бы 401.
+  let token = null;
+  try {
+    const { data } = await db.auth.getSession();    // сам обновляет токен, если он истёк
+    token = data && data.session && data.session.access_token;
+  } catch (e) { /* ниже вернём unauthorized */ }
+  if (!token) return { status: 'unauthorized', http: null, kind: 'NoSession' };
+
   let error = null;
   try {
-    const res = await db.functions.invoke(fn, { body });
+    const res = await db.functions.invoke(fn, { body, headers: { Authorization: 'Bearer ' + token } });
     if (!res.error) return res.data || { status: 'error' };
     error = res.error;
   } catch (e) {
@@ -240,7 +262,7 @@ async function groupPasswordApi(body) {
   let status;
   if (kind === 'FunctionsFetchError') status = 'network_error';
   else if (http === 404 || /not.?found/i.test(serverCode + ' ' + serverMsg)) status = 'function_not_found';
-  else if (http === 401 || http === 403 && /jwt/i.test(serverMsg)) status = 'unauthorized';
+  else if (http === 401 || (http === 403 && /jwt/i.test(serverMsg))) status = 'jwt_rejected';   // отклонил шлюз Supabase (Verify JWT), до функции не дошло
   else if (kind === 'FunctionsRelayError') status = 'relay_error';
   else if (http !== null) status = 'function_error';
   else status = 'network_error';
@@ -263,6 +285,13 @@ function groupPasswordErrorMessage(r) {
     case 'forbidden': return 'Нет прав на это действие.';
     case 'unauthorized': return 'Сессия истекла. Войдите заново.';
     case 'not_found': return 'Группа не найдена.';
+    case 'epoch_conflict': return 'Ключ группы уже был обновлён. Обновите страницу и повторите.';
+    case 'jwt_rejected': return 'Supabase отклонил токен входа ещё до функции паролей групп. Выйдите и войдите заново; если не поможет — сообщите администратору сайта.' + groupPasswordDiag(r);
+    case 'limiter_unavailable': return 'На сервере не работает ограничитель попыток (нет функции svc_rate_hit). Сообщите администратору сайта.';
+    case 'rpc_missing': return 'В базе нет нужной серверной функции для паролей групп (не применена миграция). Сообщите администратору сайта.';
+    case 'db_error': return 'Ошибка базы данных на сервере паролей групп. Повторите позже или сообщите администратору сайта.';
+    case 'decrypt_failed': return 'Сервер не смог расшифровать сохранённый пароль группы (ключ не подходит). Сообщите администратору сайта.';
+    case 'bad_request': case 'bad_action': case 'method_not_allowed': return 'Сервер не принял запрос (' + r.status + '). Обновите страницу и повторите.';
     case 'server_not_configured': return 'Сервер паролей групп ещё не настроен (нет серверного ключа).';
     case 'admin_key_not_registered': return 'Ключ администратора не зарегистрирован на сервере (миграция 08).';
     case 'rotation_required': return 'В группе включено шифрование: пароль меняется только вместе с ротацией ключа.';
