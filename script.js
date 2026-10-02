@@ -1315,6 +1315,13 @@ function setAuthBusy(form, busy, busyLabel) {
   }
 }
 
+// Email уже есть в auth.users: второй аккаунт не создаём. Показываем способы вернуть доступ.
+function showEmailTakenNotice() {
+  showNotice('Такой email уже зарегистрирован — новый аккаунт не создан. Войдите с вашим паролем, восстановите пароль или, если ещё не подтверждали почту, отправьте письмо подтверждения ещё раз.');
+  const resendBtn = document.getElementById('resend-confirm-btn');
+  if (resendBtn) resendBtn.classList.remove('hidden');
+}
+
 async function handleRegister(e) {
   e.preventDefault();
   if (authBusy) return;
@@ -1353,7 +1360,7 @@ async function handleRegister(e) {
       if (error.code === 'user_already_exists' || /already registered/i.test(error.message || '')) {
         switchTab('login', { keepMessage: true });
         document.getElementById('login-username').value = email;
-        showNotice('Такой email уже зарегистрирован. Войдите или восстановите пароль.');
+        showEmailTakenNotice();
         return;
       }
       showError(authErrorText(error));
@@ -1366,7 +1373,7 @@ async function handleRegister(e) {
     if (alreadyExists) {
       switchTab('login', { keepMessage: true });
       document.getElementById('login-username').value = email;
-      showNotice('Такой email уже зарегистрирован. Войдите или восстановите пароль.');
+      showEmailTakenNotice();
       return;
     }
 
@@ -1835,6 +1842,18 @@ function copyUserId() {
 
 
 
+// Восстановление отсутствующей строки profiles через серверную функцию ensure_my_profile()
+// (см. supabase_profile_fix.sql). Возвращает { status: 'created' | 'exists' | 'missing_rpc' | 'error' }.
+async function ensureProfileRow() {
+  try {
+    const { data, error } = await db.rpc('ensure_my_profile');
+    if (error) return { status: isMissingRpc(error) ? 'missing_rpc' : 'error', error };
+    return { status: data === 'created' ? 'created' : 'exists' };
+  } catch (e) {
+    return { status: 'error', error: e };
+  }
+}
+
 // Возвращает true, если пользователь вошёл, false — если вход не состоялся или устарел.
 async function enterApp(user) {
   // Если параллельно запущен другой вход/выход, эпоха изменится, и этот вызов молча завершится.
@@ -1842,41 +1861,70 @@ async function enterApp(user) {
   currentUser = user;
   const stale = () => epoch !== authEpoch || !currentUser || currentUser.id !== user.id;
 
-  const fetchProfile = () => db.from('profiles').select('*').eq('id', user.id).single();
+  // maybeSingle(): «строк нет» — это data=null БЕЗ ошибки. single() в этом случае даёт PGRST116,
+  // и «профиля нет» нельзя было отличить от настоящей ошибки сети/сервера.
+  const fetchProfile = () => db.from('profiles').select('*').eq('id', user.id).maybeSingle();
+
+  // Реальная ошибка запроса (сеть/сервер): в приложение не пускаем (иначе заблокированный аккаунт
+  // прошёл бы проверку только потому, что профиль не загрузился). Сессию не убиваем —
+  // пользователь может повторить, когда связь появится.
+  const failLoad = (err) => {
+    clearSessionState();
+    showError('Не удалось загрузить профиль: ' + translateAuthError(err) + ' Попробуйте ещё раз.');
+    return false;
+  };
+
   let { data: profile, error } = await fetchProfile();
   if (stale()) return false;
 
-  if (error || !profile) {
-    // Профиль создаётся триггером после регистрации и может появиться с задержкой.
-    let retryProfile = null;
-    let lastError = error;
-    for (let i = 0; i < 5 && !retryProfile; i++) {
-      await new Promise(r => setTimeout(r, 500));
-      const retry = await fetchProfile();
+  // Профиль создаётся триггером после регистрации и может появиться с небольшой задержкой.
+  for (let i = 0; i < 3 && !profile; i++) {
+    await new Promise(r => setTimeout(r, 500));
+    const retry = await fetchProfile();
+    if (stale()) return false;
+    profile = retry.data;
+    error = retry.error;
+  }
+  if (!profile && error) return failLoad(error);
+
+  let problem = 'missing';   // 'missing' | 'no_rpc' | 'rls' | 'failed'
+  if (!profile) {
+    // Аккаунт в auth.users есть (мы только что вошли), а строки в profiles нет — например, триггер
+    // не сработал или профиль был удалён. Восстанавливаем через серверную функцию: она берёт id
+    // из JWT (auth.uid()), создаёт строку только для самого пользователя и только если её нет.
+    // Клиент напрямую в profiles ничего не вставляет — иначе можно было бы выдать себе is_admin/plan.
+    const ensured = await ensureProfileRow();
+    if (stale()) return false;
+    if (ensured.status === 'created' || ensured.status === 'exists') {
+      const again = await fetchProfile();
       if (stale()) return false;
-      if (retry.data) retryProfile = retry.data; else lastError = retry.error;
-    }
-    if (retryProfile) {
-      profile = retryProfile;
-    } else if (lastError && lastError.code !== 'PGRST116') {
-      // Сетевая/серверная ошибка: в приложение не пускаем (иначе заблокированный аккаунт
-      // прошёл бы проверку только потому, что профиль не загрузился). Сессию не убиваем —
-      // пользователь может повторить, когда связь появится.
-      clearSessionState();
-      showError('Не удалось загрузить профиль: ' + translateAuthError(lastError) + ' Попробуйте ещё раз.');
-      return false;
+      if (again.error) return failLoad(again.error);
+      profile = again.data;
+      // строка существует, но SELECT её не отдаёт — значит, правила RLS не пускают владельца к своей записи
+      if (!profile && ensured.status === 'exists') problem = 'rls';
+    } else if (ensured.status === 'missing_rpc') {
+      problem = 'no_rpc';
     } else {
-      // Профиля нет (запрос выполнен успешно, строк 0). Раньше здесь подставлялась «заглушка» профиля,
-      // и сайт открывался как будто пользователь существует — например, по устаревшей сессии
-      // после очистки базы. Теперь так не делаем: без профиля вход не выполняется.
-      clearSessionState();
-      try { await db.auth.signOut({ scope: 'local' }); } catch (e) { /* локальный выход всё равно выполнен */ }
-      loadTheme();
-      switchTab('login', { keepMessage: true });
-      showError('Профиль аккаунта не найден. Если вы ещё не регистрировались — создайте аккаунт; если уже регистрировались — обратитесь к администратору сайта.');
-      logEvent('error', 'Нет профиля у вошедшего пользователя', {});
-      return false;
+      console.error('ensure_my_profile failed:', ensured.error && ensured.error.code);
+      problem = 'failed';
     }
+  }
+
+  if (!profile) {
+    clearSessionState();
+    try { await db.auth.signOut({ scope: 'local' }); } catch (e) { /* локальный выход всё равно выполнен */ }
+    loadTheme();
+    switchTab('login', { keepMessage: true });
+    // Не советуем «зарегистрироваться заново»: такой email уже занят, дубликат создать нельзя.
+    const hints = {
+      no_rpc: 'Аккаунт найден, но его профиль не создан, а функция восстановления в базе ещё не установлена. Сообщите администратору сайта.',
+      rls: 'Профиль существует, но настройки безопасности базы не дают его прочитать. Сообщите администратору сайта.',
+      failed: 'Аккаунт найден, но профиль создать не удалось. Попробуйте войти ещё раз позже или сообщите администратору сайта.',
+      missing: 'Аккаунт найден, но профиль не создан. Сообщите администратору сайта.'
+    };
+    showError(hints[problem] + ' Новый аккаунт с этим email создавать не нужно.');
+    logEvent('error', 'Нет профиля у вошедшего пользователя: ' + problem, {});
+    return false;
   }
   currentProfile = profile;
 

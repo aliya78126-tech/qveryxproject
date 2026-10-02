@@ -2829,6 +2829,33 @@
 
     .auth-title { font-size: 26px; }
     .auth-wrap { max-width: 100%; }
+
+    /* Переключатель «вход / регистрация» — на всю ширину, крупные цели нажатия */
+    .auth-tab { flex: 1; margin-right: 0; font-size: 15px; min-height: 48px; text-align: center; }
+    .auth-sub { margin-bottom: 20px; }
+    .auth-tabs { margin-bottom: 18px; }
+
+    /* На экране входа блок «Ещё нет аккаунта? Зарегистрироваться» поднят сразу под переключатель,
+       чтобы кнопку не нужно было искать прокруткой */
+    #login-form { display: flex; flex-direction: column; }
+    #login-form .auth-switch {
+      order: -1;
+      margin: 0 0 18px;
+      padding: 0 0 16px;
+      border-top: none;
+      border-bottom: 1px solid var(--line);
+    }
+
+    /* Кнопка отправки регистрации всегда прижата к нижнему краю экрана, пока форма не закончилась */
+    .auth-submit-bar {
+      position: sticky;
+      bottom: 0;
+      z-index: 3;
+      margin: 6px -6px 0;
+      padding: 10px 6px calc(10px + var(--safe-bottom));
+      background: linear-gradient(to top, var(--bg) 78%, transparent);
+    }
+    .auth-submit-bar .btn-primary { margin-top: 0; }
     #auth-screen {
       padding: calc(24px + var(--safe-top)) 18px calc(24px + var(--safe-bottom));
       /* запас снизу: поле у нижнего края не должно прятаться под экранной клавиатурой */
