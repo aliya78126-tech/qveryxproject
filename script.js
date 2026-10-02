@@ -197,17 +197,64 @@ function encRpcErrorMessage(res, error) {
 // ===== Пароли групп: хранение и проверка — только на сервере (Edge Function group-password). =====
 // Браузер отправляет пароль по HTTPS функции, она шифрует его AES-256-GCM серверным ключом
 // (ключ лежит в секретах Supabase и в браузер не попадает). Обратно пароль получает только владелец.
+// Имя развёрнутой Edge Function. Должно совпадать с именем в панели Supabase (Edge Functions → колонка Name /
+// URL вида .../functions/v1/<имя>) и с именем каталога supabase/functions/<имя> при `supabase functions deploy`.
+const GROUP_PASSWORD_FUNCTION = 'group-password';
+
+// Возвращает объект { status, ... }. Если ответила сама функция — это её JSON как есть (status: 'ok',
+// 'forbidden', 'wrong_password' и т.д.) плюс http. Иначе status описывает, на каком уровне случился сбой:
+//   'network_error'      — запрос не дошёл до Supabase (нет сети, блокировка, сбой CORS-preflight) [FunctionsFetchError]
+//   'function_not_found' — Supabase ответил, что такой функции нет (HTTP 404 / relay-ошибка)
+//   'unauthorized'       — шлюз отклонил JWT (HTTP 401)
+//   'relay_error'        — сбой на стороне Supabase между шлюзом и функцией [FunctionsRelayError]
+//   'function_error'     — функция упала и вернула не JSON (HTTP 5xx и т.п.)
+// Пароль, JWT и тело запроса не логируются.
 async function groupPasswordApi(body) {
+  const fn = GROUP_PASSWORD_FUNCTION;
+  let error = null;
   try {
-    const { data, error } = await db.functions.invoke('group-password', { body });
-    if (!error) return data || { status: 'error' };
-    if (error.context && typeof error.context.json === 'function') {
-      try { return await error.context.json(); } catch (e) { /* тело не JSON */ }
-    }
-    return { status: 'network_error' };
+    const res = await db.functions.invoke(fn, { body });
+    if (!res.error) return res.data || { status: 'error' };
+    error = res.error;
   } catch (e) {
-    return { status: 'network_error' };
+    error = e;   // исключение до получения ответа
   }
+
+  const kind = (error && error.name) || 'Error';
+  const resp = error && error.context;
+  const http = resp && typeof resp.status === 'number' ? resp.status : null;
+
+  // Разбираем тело ответа (если оно есть и это JSON)
+  let payload = null;
+  if (resp && typeof resp.json === 'function') {
+    try { payload = await resp.json(); } catch (e) { /* тело не JSON */ }
+  }
+
+  // Ответила сама функция: у неё всегда есть строковое поле status
+  if (kind === 'FunctionsHttpError' && payload && typeof payload.status === 'string') {
+    return { ...payload, http, kind };
+  }
+
+  const serverCode = payload && (payload.code != null ? String(payload.code) : '');
+  const serverMsg = payload && typeof payload.message === 'string' ? payload.message.slice(0, 160) : '';
+  let status;
+  if (kind === 'FunctionsFetchError') status = 'network_error';
+  else if (http === 404 || /not.?found/i.test(serverCode + ' ' + serverMsg)) status = 'function_not_found';
+  else if (http === 401 || http === 403 && /jwt/i.test(serverMsg)) status = 'unauthorized';
+  else if (kind === 'FunctionsRelayError') status = 'relay_error';
+  else if (http !== null) status = 'function_error';
+  else status = 'network_error';
+
+  // Только безопасные поля: тип, статус, код/сообщение шлюза (не тело запроса и не заголовки)
+  console.warn('group-password call failed:', { fn, kind, http, status, code: serverCode || undefined, message: serverMsg || undefined });
+  return { status, http, kind };
+}
+// Короткая техническая приписка для служебных ошибок: «(HTTP 404, FunctionsHttpError)»
+function groupPasswordDiag(r) {
+  const parts = [];
+  if (r && r.http) parts.push('HTTP ' + r.http);
+  if (r && r.kind) parts.push(r.kind);
+  return parts.length ? ' (' + parts.join(', ') + ')' : '';
 }
 function groupPasswordErrorMessage(r) {
   switch (r && r.status) {
@@ -215,11 +262,15 @@ function groupPasswordErrorMessage(r) {
     case 'weak_password': return 'Пароль должен содержать от 4 до 200 символов.';
     case 'forbidden': return 'Нет прав на это действие.';
     case 'unauthorized': return 'Сессия истекла. Войдите заново.';
+    case 'not_found': return 'Группа не найдена.';
     case 'server_not_configured': return 'Сервер паролей групп ещё не настроен (нет серверного ключа).';
     case 'admin_key_not_registered': return 'Ключ администратора не зарегистрирован на сервере (миграция 08).';
     case 'rotation_required': return 'В группе включено шифрование: пароль меняется только вместе с ротацией ключа.';
     case 'encrypted_group_requires_password': return 'Нельзя отключить пароль группы с шифрованием сообщений.';
-    case 'network_error': return 'Нет связи с сервером паролей групп (функция не развёрнута или нет сети).';
+    case 'network_error': return 'Нет связи с сервером. Проверьте интернет и повторите.' + groupPasswordDiag(r);
+    case 'function_not_found': return 'Сервис паролей групп не найден на сервере: функция «' + GROUP_PASSWORD_FUNCTION + '» не развёрнута или называется иначе. Сообщите администратору сайта.' + groupPasswordDiag(r);
+    case 'relay_error': return 'Сбой на стороне Supabase при обращении к функции паролей групп. Повторите позже.' + groupPasswordDiag(r);
+    case 'function_error': return 'Сервер паролей групп вернул ошибку. Повторите позже или сообщите администратору сайта.' + groupPasswordDiag(r);
     default: return 'Не удалось выполнить операцию (' + ((r && r.status) || 'нет ответа') + ').';
   }
 }
