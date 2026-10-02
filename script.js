@@ -199,7 +199,7 @@ function encRpcErrorMessage(res, error) {
 // (ключ лежит в секретах Supabase и в браузер не попадает). Обратно пароль получает только владелец.
 async function groupPasswordApi(body) {
   try {
-    const { data, error } = await db.functions.invoke('smooth-task', { body });
+    const { data, error } = await db.functions.invoke('group-password', { body });
     if (!error) return data || { status: 'error' };
     if (error.context && typeof error.context.json === 'function') {
       try { return await error.context.json(); } catch (e) { /* тело не JSON */ }
@@ -1218,7 +1218,7 @@ let selectedNoteIds = new Set();
 
 
 
-function switchTab(which) {
+function switchTab(which, opts) {
   const loginTab = document.getElementById('tab-login');
   const regTab = document.getElementById('tab-register');
   const loginForm = document.getElementById('login-form');
@@ -1226,7 +1226,16 @@ function switchTab(which) {
   const forgotForm = document.getElementById('forgot-form');
   const resetForm = document.getElementById('reset-form');
   const tabsRow = document.querySelector('.auth-tabs');
-  hideError();
+  if (!(opts && opts.keepMessage)) hideError();
+  const resendBtn = document.getElementById('resend-confirm-btn');
+  if (resendBtn && !(opts && opts.keepMessage)) resendBtn.classList.add('hidden');
+
+  // при переходе вход → регистрация переносим уже набранный email, чтобы не вводить заново
+  if (which === 'register') {
+    const typed = (document.getElementById('login-username').value || '').trim();
+    const regEmail = document.getElementById('reg-email');
+    if (typed && regEmail && !regEmail.value) regEmail.value = typed;
+  }
 
   loginForm.classList.add('hidden');
   regForm.classList.add('hidden');
@@ -1234,14 +1243,18 @@ function switchTab(which) {
   resetForm.classList.add('hidden');
   loginTab.classList.remove('active');
   regTab.classList.remove('active');
+  loginTab.setAttribute('aria-selected', 'false');
+  regTab.setAttribute('aria-selected', 'false');
 
   if (which === 'login') {
     tabsRow.classList.remove('hidden');
     loginTab.classList.add('active');
+    loginTab.setAttribute('aria-selected', 'true');
     loginForm.classList.remove('hidden');
   } else if (which === 'register') {
     tabsRow.classList.remove('hidden');
     regTab.classList.add('active');
+    regTab.setAttribute('aria-selected', 'true');
     regForm.classList.remove('hidden');
   } else if (which === 'forgot') {
     tabsRow.classList.add('hidden');
@@ -1250,19 +1263,61 @@ function switchTab(which) {
     tabsRow.classList.add('hidden');
     resetForm.classList.remove('hidden');
   }
+  // новая форма — с начала прокручиваемого экрана (на телефоне предыдущая могла быть прокручена вниз)
+  const screen = document.getElementById('auth-screen');
+  if (screen) screen.scrollTop = 0;
 }
 
 function showError(msg) {
   const el = document.getElementById('auth-error');
+  el.classList.remove('auth-notice');
+  el.setAttribute('role', 'alert');
   el.textContent = msg;
   el.classList.remove('hidden');
+  scrollAuthMessageIntoView(el);
+}
+// Не ошибка, а сообщение об успехе / дальнейших действиях (зелёное, role="status")
+function showNotice(msg) {
+  const el = document.getElementById('auth-error');
+  el.classList.add('auth-notice');
+  el.setAttribute('role', 'status');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  scrollAuthMessageIntoView(el);
 }
 function hideError() {
-  document.getElementById('auth-error').classList.add('hidden');
+  const el = document.getElementById('auth-error');
+  el.classList.add('hidden');
+  el.classList.remove('auth-notice');
+}
+function scrollAuthMessageIntoView(el) {
+  const screen = document.getElementById('auth-screen');
+  if (screen && !screen.classList.contains('hidden')) screen.scrollTop = 0;
+}
+
+// ---------- проверка полей и защита от повторной отправки ----------
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+let authBusy = false;                          // одна операция входа/регистрации за раз
+
+function setAuthBusy(form, busy, busyLabel) {
+  authBusy = busy;
+  const btn = form.querySelector('button[type="submit"]');
+  if (!btn) return;
+  if (busy) {
+    btn.dataset.label = btn.textContent;
+    btn.textContent = busyLabel;
+    btn.disabled = true;
+    form.setAttribute('aria-busy', 'true');
+  } else {
+    if (btn.dataset.label) btn.textContent = btn.dataset.label;
+    btn.disabled = false;
+    form.removeAttribute('aria-busy');
+  }
 }
 
 async function handleRegister(e) {
   e.preventDefault();
+  if (authBusy) return;
   hideError();
 
   const displayName = document.getElementById('reg-username').value.trim();
@@ -1271,53 +1326,75 @@ async function handleRegister(e) {
   const password2 = document.getElementById('reg-password2').value;
 
   if (displayName.length < 2) { showError('Имя должно содержать не менее 2 символов.'); return; }
+  if (!EMAIL_RE.test(email)) { showError('Введите корректный email, например name@example.com.'); return; }
   if (password.length < 6) { showError('Пароль должен содержать не менее 6 символов.'); return; }
   if (password !== password2) { showError('Пароли не совпадают.'); return; }
   const consentBox = document.getElementById('reg-consent');
   if (consentBox && !consentBox.checked) { showError('Необходимо согласие на обработку персональных данных.'); return; }
 
-  const submitBtn = e.target.querySelector('button[type="submit"]');
-  submitBtn.disabled = true;
-
+  const form = e.target;
+  setAuthBusy(form, true, 'Создаём аккаунт…');
   showEmailPendingModal(email);
 
   try {
     const { data, error } = await db.auth.signUp({
       email, password,
-      options: { data: { display_name: displayName, consent_at: new Date().toISOString(), consent_version: CONSENT_VERSION } }
+      options: {
+        // куда вернётся пользователь после подтверждения почты (адрес должен быть в Redirect URLs в Supabase)
+        emailRedirectTo: window.location.origin + window.location.pathname,
+        data: { display_name: displayName, consent_at: new Date().toISOString(), consent_version: CONSENT_VERSION }
+      }
     });
 
     hideEmailPendingModal();
 
     if (error) {
-      showError(translateAuthError(error.message));
-      logEvent('auth', 'Ошибка регистрации: ' + error.message, {});
+      logEvent('auth', 'Ошибка регистрации: ' + (error.code || error.message), {});
+      if (error.code === 'user_already_exists' || /already registered/i.test(error.message || '')) {
+        switchTab('login', { keepMessage: true });
+        document.getElementById('login-username').value = email;
+        showNotice('Такой email уже зарегистрирован. Войдите или восстановите пароль.');
+        return;
+      }
+      showError(authErrorText(error));
+      return;
+    }
+
+    // Если подтверждение почты включено, а email уже занят, Supabase НЕ возвращает ошибку
+    // (чтобы не раскрывать, кто зарегистрирован), а отдаёт пользователя с пустым списком identities.
+    const alreadyExists = !!(data && data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0);
+    if (alreadyExists) {
+      switchTab('login', { keepMessage: true });
+      document.getElementById('login-username').value = email;
+      showNotice('Такой email уже зарегистрирован. Войдите или восстановите пароль.');
       return;
     }
 
     logEvent('auth', 'Регистрация', {});
+    form.reset();
     if (data.session) {
+      // подтверждение почты в проекте выключено — пользователь сразу вошёл
       await enterApp(data.session.user);
     } else {
-      showError('Проверьте почту — нужно подтвердить email, затем войдите.');
-      switchTab('login');
+      // подтверждение почты включено: входить можно только после перехода по ссылке из письма
+      switchTab('login', { keepMessage: true });
+      document.getElementById('login-username').value = email;
+      showNotice('Аккаунт создан. Мы отправили письмо на ' + email + ' — перейдите по ссылке из письма (проверьте и папку «Спам»), затем войдите здесь.');
+      const resendBtn = document.getElementById('resend-confirm-btn');
+      if (resendBtn) resendBtn.classList.remove('hidden');
     }
   } catch (err) {
     hideEmailPendingModal();
-    console.error('Registration failed:', err);
-    showError('Не удалось зарегистрироваться: ' + (err && err.message ? err.message : 'неизвестная ошибка') + '. Попробуйте ещё раз.');
+    console.error('Registration failed:', err && err.name);   // без текста ошибки и данных формы
+    showError(authErrorText(err));
   } finally {
-    submitBtn.disabled = false;
+    setAuthBusy(form, false);
   }
 }
 
 function showEmailPendingModal(email) {
   const textEl = document.getElementById('email-pending-text');
-  if (textEl) {
-    textEl.textContent = email
-      ? `Отправляем письмо с подтверждением на ${email} — проверьте почту (в том числе папку «Спам») и перейдите по ссылке из письма, чтобы завершить регистрацию.`
-      : 'Отправляем письмо с подтверждением — проверьте почту (в том числе папку «Спам») и перейдите по ссылке из письма, чтобы завершить регистрацию.';
-  }
+  if (textEl) textEl.textContent = 'Создаём аккаунт для ' + email + '. Пожалуйста, подождите.';
   document.getElementById('email-pending-modal').classList.remove('hidden');
 }
 function hideEmailPendingModal() {
@@ -1326,45 +1403,95 @@ function hideEmailPendingModal() {
 
 async function handleLogin(e) {
   e.preventDefault();
+  if (authBusy) return;
   hideError();
+  const resendBtn = document.getElementById('resend-confirm-btn');
+  if (resendBtn) resendBtn.classList.add('hidden');
 
   const email = document.getElementById('login-username').value.trim();
   const password = document.getElementById('login-password').value;
+  if (!EMAIL_RE.test(email)) { showError('Введите корректный email, например name@example.com.'); return; }
+  if (!password) { showError('Введите пароль.'); return; }
 
-  const submitBtn = e.target.querySelector('button[type="submit"]');
-  submitBtn.disabled = true;
+  const form = e.target;
+  setAuthBusy(form, true, 'Входим…');
 
   try {
+    // Только вход. Аккаунт здесь никогда не создаётся автоматически.
     const { data, error } = await db.auth.signInWithPassword({ email, password });
 
     if (error) {
-      showError(translateAuthError(error.message));
-      logEvent('auth', 'Ошибка входа: ' + error.message, {});
+      logEvent('auth', 'Ошибка входа: ' + (error.code || 'unknown'), {});
+      if (error.code === 'email_not_confirmed' || /email not confirmed/i.test(error.message || '')) {
+        showError('Email ещё не подтверждён. Перейдите по ссылке из письма или запросите письмо ещё раз.');
+        if (resendBtn) resendBtn.classList.remove('hidden');
+      } else if (error.code === 'invalid_credentials' || /invalid login credentials/i.test(error.message || '')) {
+        // Supabase намеренно не различает «нет такого аккаунта» и «неверный пароль»
+        showError('Неверный email или пароль. Если аккаунта ещё нет — нажмите «Зарегистрироваться» ниже.');
+        document.getElementById('login-password').value = '';
+      } else {
+        showError(authErrorText(error));
+      }
       return;
     }
 
+    if (!data || !data.user) { showError('Не удалось войти. Попробуйте ещё раз.'); return; }
     const entered = await enterApp(data.user);
-    document.getElementById('login-form').reset();
-    if (entered) logEvent('auth', 'Вход выполнен', {});
+    if (entered) {
+      form.reset();
+      logEvent('auth', 'Вход выполнен', {});
+    }
+    // если enterApp вернул false — он сам показал причину (заблокирован, нет профиля, ошибка сети)
   } catch (err) {
-    console.error('Login failed:', err);
-    showError('Не удалось войти: ' + (err && err.message ? err.message : 'неизвестная ошибка') + '. Попробуйте ещё раз.');
+    console.error('Login failed:', err && err.name);
+    showError(authErrorText(err));
   } finally {
-    submitBtn.disabled = false;
+    setAuthBusy(form, false);
   }
 }
 
-function translateAuthError(msg) {
-  if (/invalid login credentials/i.test(msg)) return 'Неверный email или пароль.';
-  if (/already registered/i.test(msg)) return 'Такой email уже зарегистрирован.';
-  if (/password.*at least/i.test(msg)) return 'Пароль слишком короткий.';
-  if (/same password/i.test(msg)) return 'Новый пароль должен отличаться от текущего.';
-  if (/rate limit|too many/i.test(msg)) return 'Слишком много попыток. Подождите немного и попробуйте снова.';
-  if (/email not confirmed/i.test(msg)) return 'Email не подтверждён. Перейдите по ссылке из письма.';
-  if (/session.*missing|token.*(expired|invalid)|otp.*expired|link.*expired/i.test(msg)) return 'Ссылка недействительна или устарела. Запросите новую.';
-  if (/failed to fetch|network/i.test(msg)) return 'Нет соединения с сервером. Проверьте интернет и повторите.';
-  return msg;
+// Повторная отправка письма подтверждения
+async function resendConfirmation() {
+  if (authBusy) return;
+  const email = (document.getElementById('login-username').value || '').trim();
+  if (!EMAIL_RE.test(email)) { showError('Введите email в поле выше, чтобы отправить письмо ещё раз.'); return; }
+  authBusy = true;
+  const btn = document.getElementById('resend-confirm-btn');
+  if (btn) btn.disabled = true;
+  try {
+    const { error } = await db.auth.resend({
+      type: 'signup', email,
+      options: { emailRedirectTo: window.location.origin + window.location.pathname }
+    });
+    if (error) { showError(authErrorText(error)); return; }
+    showNotice('Письмо отправлено на ' + email + '. Проверьте почту, включая папку «Спам».');
+  } catch (err) {
+    showError(authErrorText(err));
+  } finally {
+    authBusy = false;
+    if (btn) btn.disabled = false;
+  }
 }
+
+// Принимает объект ошибки Supabase (предпочтительно: у него есть code) или строку сообщения.
+function translateAuthError(arg) {
+  const code = arg && typeof arg === 'object' ? (arg.code || '') : '';
+  const msg = arg && typeof arg === 'object' ? (arg.message || '') : String(arg == null ? '' : arg);
+  if (code === 'invalid_credentials' || /invalid login credentials/i.test(msg)) return 'Неверный email или пароль.';
+  if (code === 'user_already_exists' || /already registered/i.test(msg)) return 'Такой email уже зарегистрирован.';
+  if (code === 'weak_password' || /password.*(at least|weak|short)/i.test(msg)) return 'Пароль слишком простой или короткий. Используйте не менее 6 символов.';
+  if (code === 'same_password' || /same password/i.test(msg)) return 'Новый пароль должен отличаться от текущего.';
+  if (/over_.*rate_limit/.test(code) || /rate limit|too many|security purposes/i.test(msg)) return 'Слишком много попыток. Подождите немного и попробуйте снова.';
+  if (code === 'email_not_confirmed' || /email not confirmed/i.test(msg)) return 'Email не подтверждён. Перейдите по ссылке из письма.';
+  if (code === 'email_address_invalid' || /email.*invalid|invalid.*email/i.test(msg)) return 'Введите корректный email.';
+  if (code === 'signup_disabled' || /signups? (not allowed|disabled)/i.test(msg)) return 'Регистрация временно недоступна.';
+  if (code === 'user_banned') return 'Аккаунт заблокирован.';
+  if (/user.*not.*found|user_not_found/i.test(code + ' ' + msg)) return 'Аккаунт не найден. Зарегистрируйтесь.';
+  if (/session.*(missing|not.found)|token.*(expired|invalid)|jwt|otp.*expired|link.*expired|otp_expired|flow_state/i.test(code + ' ' + msg)) return 'Ссылка недействительна или устарела. Запросите новую.';
+  if (/failed to fetch|network|load failed/i.test(msg) || (arg && arg.name === 'AuthRetryableFetchError')) return 'Нет соединения с сервером. Проверьте интернет и повторите.';
+  return 'Не удалось выполнить действие. Попробуйте ещё раз.';   // внутренний текст ошибки пользователю не показываем
+}
+function authErrorText(err) { return translateAuthError(err); }
 
 
 async function handleForgotPassword(e) {
@@ -1376,21 +1503,22 @@ async function handleForgotPassword(e) {
   submitBtn.disabled = true;
 
   try {
+    if (!EMAIL_RE.test(email)) { showError('Введите корректный email.'); return; }
     const { error } = await db.auth.resetPasswordForEmail(email, {
       redirectTo: window.location.origin + window.location.pathname,
     });
 
     if (error) {
-      showError(translateAuthError(error.message));
+      showError(translateAuthError(error));
       return;
     }
 
     e.target.reset();
     switchTab('login');
-    showError('Если такой email зарегистрирован, на него отправлена ссылка для сброса пароля. Проверьте почту.');
+    showNotice('Если такой email зарегистрирован, на него отправлена ссылка для сброса пароля. Проверьте почту.');
   } catch (err) {
-    console.error('Password reset request failed:', err);
-    showError('Не удалось отправить письмо: ' + (err && err.message ? err.message : 'неизвестная ошибка') + '. Попробуйте ещё раз.');
+    console.error('Password reset request failed:', err && err.name);
+    showError(authErrorText(err));
   } finally {
     submitBtn.disabled = false;
   }
@@ -1415,7 +1543,7 @@ function setupPasswordRecoveryListener() {
       document.getElementById('auth-screen').classList.remove('hidden');
       switchTab('login');
       loadTheme();
-      showError('Сессия завершена. Войдите снова.');
+      showNotice('Сессия завершена. Войдите снова.');
       return;
     }
     // в другой вкладке вошли под другим аккаунтом (сессия общая на весь браузер):
@@ -1425,6 +1553,46 @@ function setupPasswordRecoveryListener() {
       setTimeout(() => window.location.reload(), 0);
     }
   });
+}
+
+// 'valid' | 'invalid' (пользователя нет / токен отозван) | 'offline' (сеть/сервер недоступны)
+async function verifyStoredSession() {
+  try {
+    const { data, error } = await db.auth.getUser();     // запрос к серверу Auth
+    if (!error && data && data.user) return 'valid';
+    if (!error) return 'invalid';
+    const status = error.status;
+    if (status === 401 || status === 403 || status === 404 || status === 400 ||
+        /user_not_found|bad_jwt|session_not_found|refresh_token|jwt|not.?found/i.test((error.code || '') + ' ' + (error.message || ''))) {
+      return 'invalid';
+    }
+    return 'offline';
+  } catch (e) {
+    return 'offline';
+  }
+}
+
+// Убираем из адреса токены и параметры после перехода по ссылке из письма
+function cleanAuthUrl() {
+  const h = window.location.hash || '';
+  if (/access_token=|refresh_token=|type=signup|type=magiclink|error=/.test(h)) {
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+  }
+}
+
+// Ссылка из письма просрочена/недействительна: Supabase кладёт описание в #hash
+function showAuthRedirectProblem() {
+  const h = (window.location.hash || '').replace(/^#/, '');
+  if (!h) return;
+  const params = new URLSearchParams(h);
+  const code = params.get('error_code') || '';
+  if (!params.get('error') && !code) return;
+  if (/expired|otp_expired/i.test(code + ' ' + (params.get('error_description') || ''))) {
+    showError('Ссылка из письма устарела или уже использована. Войдите (если аккаунт уже подтверждён) или запросите письмо ещё раз.');
+  } else {
+    showError('Не удалось подтвердить email по ссылке. Попробуйте войти или запросите письмо ещё раз.');
+  }
+  history.replaceState(null, '', window.location.pathname + window.location.search);
 }
 
 function passwordRecoveryLinkPresent() {
@@ -1450,7 +1618,7 @@ async function handleResetPassword(e) {
     const { data, error } = await db.auth.updateUser({ password });
 
     if (error) {
-      showError(translateAuthError(error.message));
+      showError(translateAuthError(error));
       return;
     }
 
@@ -1463,11 +1631,11 @@ async function handleResetPassword(e) {
       await enterApp(data.user);
     } else {
       switchTab('login');
-      showError('Пароль обновлён. Войдите с новым паролем.');
+      showNotice('Пароль обновлён. Войдите с новым паролем.');
     }
   } catch (err) {
-    console.error('Password update failed:', err);
-    showError('Не удалось сохранить пароль: ' + (err && err.message ? err.message : 'неизвестная ошибка') + '. Попробуйте ещё раз.');
+    console.error('Password update failed:', err && err.name);
+    showError(authErrorText(err));
   } finally {
     submitBtn.disabled = false;
   }
@@ -1691,14 +1859,23 @@ async function enterApp(user) {
     if (retryProfile) {
       profile = retryProfile;
     } else if (lastError && lastError.code !== 'PGRST116') {
-      // Сетевая/серверная ошибка: не пускаем с «заглушкой» — иначе заблокированный
-      // аккаунт (banned) прошёл бы проверку только потому, что профиль не загрузился.
-      currentUser = null;
-      try { await db.auth.signOut(); } catch (e) {}
-      showError('Не удалось загрузить профиль: ' + translateAuthError(lastError.message || 'ошибка сети') + ' Попробуйте ещё раз.');
+      // Сетевая/серверная ошибка: в приложение не пускаем (иначе заблокированный аккаунт
+      // прошёл бы проверку только потому, что профиль не загрузился). Сессию не убиваем —
+      // пользователь может повторить, когда связь появится.
+      clearSessionState();
+      showError('Не удалось загрузить профиль: ' + translateAuthError(lastError) + ' Попробуйте ещё раз.');
       return false;
     } else {
-      profile = { id: user.id, display_name: user.email, plan: 'free' };
+      // Профиля нет (запрос выполнен успешно, строк 0). Раньше здесь подставлялась «заглушка» профиля,
+      // и сайт открывался как будто пользователь существует — например, по устаревшей сессии
+      // после очистки базы. Теперь так не делаем: без профиля вход не выполняется.
+      clearSessionState();
+      try { await db.auth.signOut({ scope: 'local' }); } catch (e) { /* локальный выход всё равно выполнен */ }
+      loadTheme();
+      switchTab('login', { keepMessage: true });
+      showError('Профиль аккаунта не найден. Если вы ещё не регистрировались — создайте аккаунт; если уже регистрировались — обратитесь к администратору сайта.');
+      logEvent('error', 'Нет профиля у вошедшего пользователя', {});
+      return false;
     }
   }
   currentProfile = profile;
@@ -4810,3 +4987,63 @@ function setupSidebarResize() {
     localStorage.removeItem(SIDEBAR_WIDTH_KEY);
   });
 }
+
+
+(async function init() {
+  loadTheme();
+  setupSpearSwingFeature();
+  setupWallpaperResizeWatcher();
+  loadSidebarWidth();
+  setupSidebarResize();
+  switchTab('login');
+  setupPasswordRecoveryListener();
+
+
+
+
+
+
+  if (passwordRecoveryLinkPresent()) {
+    switchTab('reset');
+  }
+
+  // Ссылка из письма могла вернуть ошибку в адресе (#error=access_denied&error_code=otp_expired ...)
+  showAuthRedirectProblem();
+
+  try {
+    const { data, error } = await db.auth.getSession();
+    if (error) throw error;
+
+    if (data.session && !passwordRecoveryLinkPresent()) {
+      // getSession() читает сессию из localStorage и НЕ проверяет, что пользователь ещё существует.
+      // После очистки базы в браузере остаётся «живой» токен удалённого аккаунта — спрашиваем сервер.
+      const verdict = await verifyStoredSession();
+      if (verdict === 'invalid') {
+        try { await db.auth.signOut({ scope: 'local' }); } catch (e) { /* уже очищено */ }
+        loadTheme();
+        switchTab('login', { keepMessage: true });
+        showNotice('Сессия устарела или аккаунт больше не существует. Войдите снова или зарегистрируйтесь.');
+      } else if (verdict === 'offline') {
+        showError('Нет соединения с сервером. Проверьте интернет и обновите страницу.');
+      } else {
+        const entered = await enterApp(data.session.user);
+        if (entered) {
+          cleanAuthUrl();
+          await checkReturnFromYoomoney();
+        }
+      }
+    }
+    // нет сессии — это ещё не «нет аккаунта»: остаёмся на экране входа, регистрация рядом
+  } catch (err) {
+    console.error('Session restore failed:', err && err.name);
+    showError(authErrorText(err));
+  }
+
+  // экранная клавиатура: поле в фокусе должно оставаться в видимой области прокручиваемого экрана
+  document.getElementById('auth-screen').addEventListener('focusin', (ev) => {
+    const t = ev.target;
+    if (t && (t.tagName === 'INPUT') && t.type !== 'checkbox') {
+      setTimeout(() => { try { t.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) {} }, 300);
+    }
+  });
+})();

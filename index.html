@@ -26,13 +26,13 @@
       <button class="auth-tab" id="tab-register" onclick="switchTab('register')" type="button">регистрация</button>
     </div>
 
-    <div id="auth-error" class="auth-error hidden" role="alert"></div>
+    <div id="auth-error" class="auth-error hidden" role="alert" aria-live="polite"></div>
 
     <!-- LOGIN FORM -->
     <form id="login-form" onsubmit="handleLogin(event)">
       <div class="field">
         <label for="login-username">Email</label>
-        <input type="email" id="login-username" autocomplete="username" required>
+        <input type="email" id="login-username" autocomplete="username" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false" required>
       </div>
       <div class="field">
         <label for="login-password">Пароль</label>
@@ -40,17 +40,22 @@
       </div>
       <button type="submit" class="btn-primary">Войти</button>
       <button type="button" class="auth-link-btn" onclick="switchTab('forgot')">Забыли пароль?</button>
+      <button type="button" class="auth-link-btn hidden" id="resend-confirm-btn" onclick="resendConfirmation()">Отправить письмо подтверждения ещё раз</button>
+      <div class="auth-switch">
+        Ещё нет аккаунта?
+        <button type="button" class="auth-switch-btn" onclick="switchTab('register')">Зарегистрироваться</button>
+      </div>
     </form>
 
     <!-- REGISTER FORM -->
     <form id="register-form" class="hidden" onsubmit="handleRegister(event)">
       <div class="field">
         <label for="reg-username">Отображаемое имя</label>
-        <input type="text" id="reg-username" autocomplete="username" minlength="2" required>
+        <input type="text" id="reg-username" autocomplete="nickname" minlength="2" maxlength="40" required>
       </div>
       <div class="field">
         <label for="reg-email">Email</label>
-        <input type="email" id="reg-email" autocomplete="username" required>
+        <input type="email" id="reg-email" autocomplete="email" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false" required>
       </div>
       <div class="field">
         <label for="reg-password">Пароль</label>
@@ -67,6 +72,10 @@
         </label>
       </div>
       <button type="submit" class="btn-primary">Создать аккаунт</button>
+      <div class="auth-switch">
+        Уже есть аккаунт?
+        <button type="button" class="auth-switch-btn" onclick="switchTab('login')">Войти</button>
+      </div>
     </form>
 
     <!-- FORGOT PASSWORD: request reset link -->
@@ -74,7 +83,7 @@
       <p class="auth-sub" style="margin:0 0 20px;">Введите email — пришлём ссылку для сброса пароля.</p>
       <div class="field">
         <label for="forgot-email">Email</label>
-        <input type="email" id="forgot-email" autocomplete="username" required>
+        <input type="email" id="forgot-email" autocomplete="email" inputmode="email" autocapitalize="off" autocorrect="off" spellcheck="false" required>
       </div>
       <button type="submit" class="btn-primary">Отправить ссылку</button>
       <button type="button" class="auth-link-btn" onclick="switchTab('login')">← Назад ко входу</button>
@@ -196,8 +205,8 @@
   <div class="modal-card email-pending-card">
     <div class="email-pending-icon">✉️</div>
     <div class="modal-eyebrow">регистрация</div>
-    <h2 class="modal-title">Сейчас придёт <em>письмо на почту.</em></h2>
-    <p class="modal-sub" id="email-pending-text">Отправляем письмо с подтверждением — проверьте почту (в том числе папку «Спам») и перейдите по ссылке из письма, чтобы завершить регистрацию.</p>
+    <h2 class="modal-title">Создаём <em>аккаунт…</em></h2>
+    <p class="modal-sub" id="email-pending-text">Пожалуйста, подождите.</p>
   </div>
 </div>
 
