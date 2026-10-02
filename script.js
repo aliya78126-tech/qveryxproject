@@ -194,12 +194,12 @@ function encRpcErrorMessage(res, error) {
   if (st === 'epoch_conflict') return 'ключ группы уже был обновлён — обновите страницу';
   return 'неизвестная ошибка (' + (st || 'нет ответа') + ')';
 }
-// ===== Пароли групп: хранение и проверка — только на сервере (Edge Function group-password). =====
+// ===== Пароли групп: хранение и проверка — только на сервере (Edge Function smooth-task). =====
 // Браузер отправляет пароль по HTTPS функции, она шифрует его AES-256-GCM серверным ключом
 // (ключ лежит в секретах Supabase и в браузер не попадает). Обратно пароль получает только владелец.
 // Имя развёрнутой Edge Function. Должно совпадать с именем в панели Supabase (Edge Functions → колонка Name /
 // URL вида .../functions/v1/<имя>) и с именем каталога supabase/functions/<имя> при `supabase functions deploy`.
-const GROUP_PASSWORD_FUNCTION = 'group-password';
+const GROUP_PASSWORD_FUNCTION = 'smooth-task';
 
 // Возвращает объект { status, ... }. Если ответила сама функция — это её JSON как есть (status: 'ok',
 // 'forbidden', 'wrong_password' и т.д.) плюс http. Иначе status описывает, на каком уровне случился сбой:
