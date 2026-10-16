@@ -194,89 +194,20 @@ function encRpcErrorMessage(res, error) {
   if (st === 'epoch_conflict') return 'ключ группы уже был обновлён — обновите страницу';
   return 'неизвестная ошибка (' + (st || 'нет ответа') + ')';
 }
-// ===== Пароли групп: хранение и проверка — только на сервере (Edge Function smooth-task). =====
+// ===== Пароли групп: хранение и проверка — только на сервере (Edge Function group-password). =====
 // Браузер отправляет пароль по HTTPS функции, она шифрует его AES-256-GCM серверным ключом
 // (ключ лежит в секретах Supabase и в браузер не попадает). Обратно пароль получает только владелец.
-// Имя развёрнутой Edge Function. Должно совпадать с именем в панели Supabase (Edge Functions → колонка Name /
-// URL вида .../functions/v1/<имя>) и с именем каталога supabase/functions/<имя> при `supabase functions deploy`.
-const GROUP_PASSWORD_FUNCTION = 'smooth-task';
-
-// Возвращает объект { status, ... }. Если ответила сама функция — это её JSON как есть (status: 'ok',
-// 'forbidden', 'wrong_password' и т.д.) плюс http. Иначе status описывает, на каком уровне случился сбой:
-//   'network_error'      — запрос не дошёл до Supabase (нет сети, блокировка, сбой CORS-preflight) [FunctionsFetchError]
-//   'function_not_found' — Supabase ответил, что такой функции нет (HTTP 404 / relay-ошибка)
-//   'jwt_rejected'       — шлюз Supabase отклонил JWT (HTTP 401), код функции не выполнялся
-//   'unauthorized'       — нет сессии или функция не приняла токен (её собственный ответ 401)
-//   'relay_error'        — сбой на стороне Supabase между шлюзом и функцией [FunctionsRelayError]
-//   'function_error'     — функция упала и вернула не JSON (HTTP 5xx и т.п.)
-// Пароль, JWT и тело запроса не логируются.
 async function groupPasswordApi(body) {
-  let r = await groupPasswordCall(body);
-  // 401 приходит и от шлюза (просрочен/отклонён JWT), и от самой функции (токен не проверился).
-  // Запрос отклонён до выполнения действия, поэтому один раз обновляем сессию и повторяем.
-  if (r.status === 'unauthorized' || r.status === 'jwt_rejected') {
-    try {
-      const { data, error } = await db.auth.refreshSession();
-      if (!error && data && data.session) r = await groupPasswordCall(body);
-    } catch (e) { /* остаётся исходная ошибка авторизации */ }
-  }
-  return r;
-}
-
-async function groupPasswordCall(body) {
-  const fn = GROUP_PASSWORD_FUNCTION;
-  // Токен берём явно: без сессии supabase-js подставил бы anon-ключ, и функция ответила бы 401.
-  let token = null;
   try {
-    const { data } = await db.auth.getSession();    // сам обновляет токен, если он истёк
-    token = data && data.session && data.session.access_token;
-  } catch (e) { /* ниже вернём unauthorized */ }
-  if (!token) return { status: 'unauthorized', http: null, kind: 'NoSession' };
-
-  let error = null;
-  try {
-    const res = await db.functions.invoke(fn, { body, headers: { Authorization: 'Bearer ' + token } });
-    if (!res.error) return res.data || { status: 'error' };
-    error = res.error;
+    const { data, error } = await db.functions.invoke('group-password', { body });
+    if (!error) return data || { status: 'error' };
+    if (error.context && typeof error.context.json === 'function') {
+      try { return await error.context.json(); } catch (e) { /* тело не JSON */ }
+    }
+    return { status: 'network_error' };
   } catch (e) {
-    error = e;   // исключение до получения ответа
+    return { status: 'network_error' };
   }
-
-  const kind = (error && error.name) || 'Error';
-  const resp = error && error.context;
-  const http = resp && typeof resp.status === 'number' ? resp.status : null;
-
-  // Разбираем тело ответа (если оно есть и это JSON)
-  let payload = null;
-  if (resp && typeof resp.json === 'function') {
-    try { payload = await resp.json(); } catch (e) { /* тело не JSON */ }
-  }
-
-  // Ответила сама функция: у неё всегда есть строковое поле status
-  if (kind === 'FunctionsHttpError' && payload && typeof payload.status === 'string') {
-    return { ...payload, http, kind };
-  }
-
-  const serverCode = payload && (payload.code != null ? String(payload.code) : '');
-  const serverMsg = payload && typeof payload.message === 'string' ? payload.message.slice(0, 160) : '';
-  let status;
-  if (kind === 'FunctionsFetchError') status = 'network_error';
-  else if (http === 404 || /not.?found/i.test(serverCode + ' ' + serverMsg)) status = 'function_not_found';
-  else if (http === 401 || (http === 403 && /jwt/i.test(serverMsg))) status = 'jwt_rejected';   // отклонил шлюз Supabase (Verify JWT), до функции не дошло
-  else if (kind === 'FunctionsRelayError') status = 'relay_error';
-  else if (http !== null) status = 'function_error';
-  else status = 'network_error';
-
-  // Только безопасные поля: тип, статус, код/сообщение шлюза (не тело запроса и не заголовки)
-  console.warn('group-password call failed:', { fn, kind, http, status, code: serverCode || undefined, message: serverMsg || undefined });
-  return { status, http, kind };
-}
-// Короткая техническая приписка для служебных ошибок: «(HTTP 404, FunctionsHttpError)»
-function groupPasswordDiag(r) {
-  const parts = [];
-  if (r && r.http) parts.push('HTTP ' + r.http);
-  if (r && r.kind) parts.push(r.kind);
-  return parts.length ? ' (' + parts.join(', ') + ')' : '';
 }
 function groupPasswordErrorMessage(r) {
   switch (r && r.status) {
@@ -284,22 +215,11 @@ function groupPasswordErrorMessage(r) {
     case 'weak_password': return 'Пароль должен содержать от 4 до 200 символов.';
     case 'forbidden': return 'Нет прав на это действие.';
     case 'unauthorized': return 'Сессия истекла. Войдите заново.';
-    case 'not_found': return 'Группа не найдена.';
-    case 'epoch_conflict': return 'Ключ группы уже был обновлён. Обновите страницу и повторите.';
-    case 'jwt_rejected': return 'Supabase отклонил токен входа ещё до функции паролей групп. Выйдите и войдите заново; если не поможет — сообщите администратору сайта.' + groupPasswordDiag(r);
-    case 'limiter_unavailable': return 'На сервере не работает ограничитель попыток (нет функции svc_rate_hit). Сообщите администратору сайта.';
-    case 'rpc_missing': return 'В базе нет нужной серверной функции для паролей групп (не применена миграция). Сообщите администратору сайта.';
-    case 'db_error': return 'Ошибка базы данных на сервере паролей групп. Повторите позже или сообщите администратору сайта.';
-    case 'decrypt_failed': return 'Сервер не смог расшифровать сохранённый пароль группы (ключ не подходит). Сообщите администратору сайта.';
-    case 'bad_request': case 'bad_action': case 'method_not_allowed': return 'Сервер не принял запрос (' + r.status + '). Обновите страницу и повторите.';
     case 'server_not_configured': return 'Сервер паролей групп ещё не настроен (нет серверного ключа).';
     case 'admin_key_not_registered': return 'Ключ администратора не зарегистрирован на сервере (миграция 08).';
     case 'rotation_required': return 'В группе включено шифрование: пароль меняется только вместе с ротацией ключа.';
     case 'encrypted_group_requires_password': return 'Нельзя отключить пароль группы с шифрованием сообщений.';
-    case 'network_error': return 'Нет связи с сервером. Проверьте интернет и повторите.' + groupPasswordDiag(r);
-    case 'function_not_found': return 'Сервис паролей групп не найден на сервере: функция «' + GROUP_PASSWORD_FUNCTION + '» не развёрнута или называется иначе. Сообщите администратору сайта.' + groupPasswordDiag(r);
-    case 'relay_error': return 'Сбой на стороне Supabase при обращении к функции паролей групп. Повторите позже.' + groupPasswordDiag(r);
-    case 'function_error': return 'Сервер паролей групп вернул ошибку. Повторите позже или сообщите администратору сайта.' + groupPasswordDiag(r);
+    case 'network_error': return 'Нет связи с сервером паролей групп (функция не развёрнута или нет сети).';
     default: return 'Не удалось выполнить операцию (' + ((r && r.status) || 'нет ответа') + ').';
   }
 }
@@ -476,6 +396,27 @@ const WALLPAPERS = [
     desktopOnly: true,
     thumb: '90004-thumb.webp',
     full: '90004-full.webp',
+  },
+  {
+    id: '37692',
+    name: 'белые волосы и красный глаз',
+    desktopOnly: true,
+    thumb: '37692-thumb.webp',
+    full: '37692-full.webp',
+  },
+  {
+    id: '37761',
+    name: 'жёлтые смайлики',
+    desktopOnly: true,
+    thumb: '37761-thumb.webp',
+    full: '37761-full.webp',
+  },
+  {
+    id: '37762',
+    name: 'ночной город и люди в плащах',
+    desktopOnly: true,
+    thumb: '37762-thumb.webp',
+    full: '37762-full.webp',
   },
 ];
 
@@ -1395,13 +1336,6 @@ function setAuthBusy(form, busy, busyLabel) {
   }
 }
 
-// Email уже есть в auth.users: второй аккаунт не создаём. Показываем способы вернуть доступ.
-function showEmailTakenNotice() {
-  showNotice('Такой email уже зарегистрирован — новый аккаунт не создан. Войдите с вашим паролем, восстановите пароль или, если ещё не подтверждали почту, отправьте письмо подтверждения ещё раз.');
-  const resendBtn = document.getElementById('resend-confirm-btn');
-  if (resendBtn) resendBtn.classList.remove('hidden');
-}
-
 async function handleRegister(e) {
   e.preventDefault();
   if (authBusy) return;
@@ -1440,7 +1374,7 @@ async function handleRegister(e) {
       if (error.code === 'user_already_exists' || /already registered/i.test(error.message || '')) {
         switchTab('login', { keepMessage: true });
         document.getElementById('login-username').value = email;
-        showEmailTakenNotice();
+        showNotice('Такой email уже зарегистрирован. Войдите или восстановите пароль.');
         return;
       }
       showError(authErrorText(error));
@@ -1453,7 +1387,7 @@ async function handleRegister(e) {
     if (alreadyExists) {
       switchTab('login', { keepMessage: true });
       document.getElementById('login-username').value = email;
-      showEmailTakenNotice();
+      showNotice('Такой email уже зарегистрирован. Войдите или восстановите пароль.');
       return;
     }
 
@@ -1922,18 +1856,6 @@ function copyUserId() {
 
 
 
-// Восстановление отсутствующей строки profiles через серверную функцию ensure_my_profile()
-// (см. supabase_profile_fix.sql). Возвращает { status: 'created' | 'exists' | 'missing_rpc' | 'error' }.
-async function ensureProfileRow() {
-  try {
-    const { data, error } = await db.rpc('ensure_my_profile');
-    if (error) return { status: isMissingRpc(error) ? 'missing_rpc' : 'error', error };
-    return { status: data === 'created' ? 'created' : 'exists' };
-  } catch (e) {
-    return { status: 'error', error: e };
-  }
-}
-
 // Возвращает true, если пользователь вошёл, false — если вход не состоялся или устарел.
 async function enterApp(user) {
   // Если параллельно запущен другой вход/выход, эпоха изменится, и этот вызов молча завершится.
@@ -1941,70 +1863,41 @@ async function enterApp(user) {
   currentUser = user;
   const stale = () => epoch !== authEpoch || !currentUser || currentUser.id !== user.id;
 
-  // maybeSingle(): «строк нет» — это data=null БЕЗ ошибки. single() в этом случае даёт PGRST116,
-  // и «профиля нет» нельзя было отличить от настоящей ошибки сети/сервера.
-  const fetchProfile = () => db.from('profiles').select('*').eq('id', user.id).maybeSingle();
-
-  // Реальная ошибка запроса (сеть/сервер): в приложение не пускаем (иначе заблокированный аккаунт
-  // прошёл бы проверку только потому, что профиль не загрузился). Сессию не убиваем —
-  // пользователь может повторить, когда связь появится.
-  const failLoad = (err) => {
-    clearSessionState();
-    showError('Не удалось загрузить профиль: ' + translateAuthError(err) + ' Попробуйте ещё раз.');
-    return false;
-  };
-
+  const fetchProfile = () => db.from('profiles').select('*').eq('id', user.id).single();
   let { data: profile, error } = await fetchProfile();
   if (stale()) return false;
 
-  // Профиль создаётся триггером после регистрации и может появиться с небольшой задержкой.
-  for (let i = 0; i < 3 && !profile; i++) {
-    await new Promise(r => setTimeout(r, 500));
-    const retry = await fetchProfile();
-    if (stale()) return false;
-    profile = retry.data;
-    error = retry.error;
-  }
-  if (!profile && error) return failLoad(error);
-
-  let problem = 'missing';   // 'missing' | 'no_rpc' | 'rls' | 'failed'
-  if (!profile) {
-    // Аккаунт в auth.users есть (мы только что вошли), а строки в profiles нет — например, триггер
-    // не сработал или профиль был удалён. Восстанавливаем через серверную функцию: она берёт id
-    // из JWT (auth.uid()), создаёт строку только для самого пользователя и только если её нет.
-    // Клиент напрямую в profiles ничего не вставляет — иначе можно было бы выдать себе is_admin/plan.
-    const ensured = await ensureProfileRow();
-    if (stale()) return false;
-    if (ensured.status === 'created' || ensured.status === 'exists') {
-      const again = await fetchProfile();
+  if (error || !profile) {
+    // Профиль создаётся триггером после регистрации и может появиться с задержкой.
+    let retryProfile = null;
+    let lastError = error;
+    for (let i = 0; i < 5 && !retryProfile; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      const retry = await fetchProfile();
       if (stale()) return false;
-      if (again.error) return failLoad(again.error);
-      profile = again.data;
-      // строка существует, но SELECT её не отдаёт — значит, правила RLS не пускают владельца к своей записи
-      if (!profile && ensured.status === 'exists') problem = 'rls';
-    } else if (ensured.status === 'missing_rpc') {
-      problem = 'no_rpc';
-    } else {
-      console.error('ensure_my_profile failed:', ensured.error && ensured.error.code);
-      problem = 'failed';
+      if (retry.data) retryProfile = retry.data; else lastError = retry.error;
     }
-  }
-
-  if (!profile) {
-    clearSessionState();
-    try { await db.auth.signOut({ scope: 'local' }); } catch (e) { /* локальный выход всё равно выполнен */ }
-    loadTheme();
-    switchTab('login', { keepMessage: true });
-    // Не советуем «зарегистрироваться заново»: такой email уже занят, дубликат создать нельзя.
-    const hints = {
-      no_rpc: 'Аккаунт найден, но его профиль не создан, а функция восстановления в базе ещё не установлена. Сообщите администратору сайта.',
-      rls: 'Профиль существует, но настройки безопасности базы не дают его прочитать. Сообщите администратору сайта.',
-      failed: 'Аккаунт найден, но профиль создать не удалось. Попробуйте войти ещё раз позже или сообщите администратору сайта.',
-      missing: 'Аккаунт найден, но профиль не создан. Сообщите администратору сайта.'
-    };
-    showError(hints[problem] + ' Новый аккаунт с этим email создавать не нужно.');
-    logEvent('error', 'Нет профиля у вошедшего пользователя: ' + problem, {});
-    return false;
+    if (retryProfile) {
+      profile = retryProfile;
+    } else if (lastError && lastError.code !== 'PGRST116') {
+      // Сетевая/серверная ошибка: в приложение не пускаем (иначе заблокированный аккаунт
+      // прошёл бы проверку только потому, что профиль не загрузился). Сессию не убиваем —
+      // пользователь может повторить, когда связь появится.
+      clearSessionState();
+      showError('Не удалось загрузить профиль: ' + translateAuthError(lastError) + ' Попробуйте ещё раз.');
+      return false;
+    } else {
+      // Профиля нет (запрос выполнен успешно, строк 0). Раньше здесь подставлялась «заглушка» профиля,
+      // и сайт открывался как будто пользователь существует — например, по устаревшей сессии
+      // после очистки базы. Теперь так не делаем: без профиля вход не выполняется.
+      clearSessionState();
+      try { await db.auth.signOut({ scope: 'local' }); } catch (e) { /* локальный выход всё равно выполнен */ }
+      loadTheme();
+      switchTab('login', { keepMessage: true });
+      showError('Профиль аккаунта не найден. Если вы ещё не регистрировались — создайте аккаунт; если уже регистрировались — обратитесь к администратору сайта.');
+      logEvent('error', 'Нет профиля у вошедшего пользователя', {});
+      return false;
+    }
   }
   currentProfile = profile;
 
